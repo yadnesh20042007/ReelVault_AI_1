@@ -1,0 +1,5 @@
+export const demoReels = [
+ { title: 'Build something extraordinary.', name: 'Nova AI Challenge', category: 'Hackathon', reward: '₹5 lakh prize pool', deadline: '15 November 2026', handle: '@nova.creators', theme: 'nova', detail: 'A weekend. Your team. An idea that could change everything.', benefit: 'Mentorship + a chance to win', eligibility: 'College students · Teams of 2–4' },
+ { title: 'Your first big break. From anywhere.', name: 'Orbit Creative Internship', category: 'Internship', reward: '₹30,000 / month', deadline: '1 December 2026', handle: '@orbit.studio', theme: 'orbit', detail: 'Create with a small team. Learn from people who love their craft.', benefit: '12 weeks of paid creative work', eligibility: 'Students & recent graduates · Remote' },
+ { title: 'Big ideas deserve a head start.', name: 'Lumen Future Scholarship', category: 'Scholarship', reward: '₹80,000 study grant', deadline: '31 December 2026', handle: '@lumen.future', theme: 'lumen', detail: 'A little support for the next generation of extraordinary thinkers.', benefit: 'A grant toward your education', eligibility: 'Undergraduate STEM students' },
+];

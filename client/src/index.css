@@ -1,0 +1,218 @@
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Syne:wght@600;700;800&family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+@import "tailwindcss";
+
+:root {
+  --app-bg: #FBF7FD;
+  --app-surface-pink: #F9ECF5;
+  --app-surface-lavender: #F0E8FF;
+  --app-purple: #8B5CF6;
+  --app-purple-deep: #6D28D9;
+  --app-purple-hover: #7C3AED;
+  --app-border: #E3D4F8;
+  --app-border-subtle: #F1E8FC;
+  --app-pink: #E9A8D4;
+  --app-text: #261B33;
+  --app-text-muted: #776A83;
+  --app-card: #FFFFFF;
+}
+
+@theme {
+  --color-app-bg: #FBF7FD;
+  --color-app-surface-pink: #F9ECF5;
+  --color-app-surface-lavender: #F0E8FF;
+  --color-app-purple: #8B5CF6;
+  --color-app-purple-deep: #6D28D9;
+  --color-app-purple-hover: #7C3AED;
+  --color-app-border: #E3D4F8;
+  --color-app-border-subtle: #F1E8FC;
+  --color-app-pink: #E9A8D4;
+  --color-app-text: #261B33;
+  --color-app-text-muted: #776A83;
+  --color-app-card: #FFFFFF;
+  
+  /* Backward-compatible remapping of legacy brand tokens */
+  --color-brand-bg: #FBF7FD;
+  --color-brand-teal: #6D28D9;
+  --color-brand-lime: #E9A8D4;
+  --color-brand-dark: #261B33;
+  
+  /* Landing page visual tokens - preserved exactly */
+  --color-purple-bg: #10071F;
+  --color-purple-card: #1B1035;
+  --color-purple-accent: #A855F7;
+  --color-purple-neon: #C084FC;
+  --color-purple-glow: #E879F9;
+}
+
+body {
+  background-color: var(--app-bg);
+  color: var(--app-text);
+  font-family: 'Plus Jakarta Sans', 'Inter', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.font-display {
+  font-family: 'Oswald', sans-serif;
+  font-weight: 700;
+}
+
+.font-heading {
+  font-family: 'Syne', sans-serif;
+}
+
+/* Landing Page Ambient & Futuristic Purple Utilities */
+.purple-mesh {
+  background: 
+    radial-gradient(circle at 50% 0%, rgba(168, 85, 247, 0.18) 0%, transparent 60%),
+    radial-gradient(circle at 85% 20%, rgba(232, 121, 249, 0.12) 0%, transparent 50%),
+    radial-gradient(circle at 15% 55%, rgba(192, 132, 252, 0.12) 0%, transparent 55%),
+    radial-gradient(circle at 50% 100%, rgba(99, 102, 241, 0.2) 0%, transparent 70%),
+    #10071F;
+}
+
+.glow-purple {
+  box-shadow: 0 0 25px -4px rgba(168, 85, 247, 0.5), 0 0 10px -2px rgba(168, 85, 247, 0.3);
+}
+
+.glow-purple-sm {
+  box-shadow: 0 0 14px -2px rgba(168, 85, 247, 0.4);
+}
+
+.glow-purple-lg {
+  box-shadow: 0 0 45px -5px rgba(168, 85, 247, 0.45), 0 0 20px -2px rgba(232, 121, 249, 0.3);
+}
+
+.glow-pink {
+  box-shadow: 0 0 30px -4px rgba(232, 121, 249, 0.45);
+}
+
+.text-glow-purple {
+  text-shadow: 0 0 20px rgba(168, 85, 247, 0.65), 0 0 40px rgba(168, 85, 247, 0.35);
+}
+
+.text-glow-pink {
+  text-shadow: 0 0 20px rgba(232, 121, 249, 0.65);
+}
+
+.glass-panel-purple {
+  background: rgba(27, 16, 53, 0.7);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(168, 85, 247, 0.22);
+}
+
+.glass-panel-hover-purple {
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.glass-panel-hover-purple:hover {
+  background: rgba(35, 20, 68, 0.85);
+  border-color: rgba(192, 132, 252, 0.4);
+  box-shadow: 0 14px 40px -8px rgba(0, 0, 0, 0.6), 0 0 25px -4px rgba(168, 85, 247, 0.25);
+  transform: translateY(-4px);
+}
+
+/* Floating animation */
+@keyframes floatSlowPurple {
+  0%, 100% {
+    transform: translateY(0px) rotate(0deg);
+  }
+  50% {
+    transform: translateY(-8px) rotate(0.6deg);
+  }
+}
+
+.animate-float-slow {
+  animation: floatSlowPurple 7s ease-in-out infinite;
+}
+
+@keyframes pulseGlowPurple {
+  0%, 100% {
+    opacity: 0.4;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.75;
+    transform: scale(1.08);
+  }
+}
+
+.animate-pulse-glow {
+  animation: pulseGlowPurple 5s ease-in-out infinite;
+}
+
+/* Scanning laser line */
+@keyframes laserSweep {
+  0% {
+    top: 0%;
+    opacity: 0;
+  }
+  15% {
+    opacity: 1;
+  }
+  85% {
+    opacity: 1;
+  }
+  100% {
+    top: 100%;
+    opacity: 0;
+  }
+}
+
+.animate-laser-sweep {
+  animation: laserSweep 1.8s ease-in-out infinite;
+}
+
+/* Spider & Thor Mascot Animations */
+@keyframes spiderFloat {
+  0%, 100% {
+    transform: translateY(0px) rotate(0deg);
+  }
+  50% {
+    transform: translateY(-6px) rotate(-1.5deg);
+  }
+}
+
+.animate-spider-idle {
+  animation: spiderFloat 3.2s ease-in-out infinite;
+}
+
+@keyframes pointNudge {
+  0%, 100% {
+    transform: translateX(0);
+  }
+  50% {
+    transform: translateX(4px);
+  }
+}
+
+.animate-point-nudge {
+  animation: pointNudge 1.6s ease-in-out infinite;
+}
+
+/* Phone Shake on Lightning Impact */
+@keyframes phoneShake {
+  0%, 100% { transform: translateX(0) rotate(0deg); }
+  20% { transform: translateX(-6px) rotate(-1deg); }
+  40% { transform: translateX(6px) rotate(1deg); }
+  60% { transform: translateX(-4px) rotate(-0.5deg); }
+  80% { transform: translateX(4px) rotate(0.5deg); }
+}
+
+.animate-phone-shake {
+  animation: phoneShake 0.5s ease-in-out;
+}
+
+/* Reduced motion preference */
+@media (prefers-reduced-motion: reduce) {
+  .animate-float-slow,
+  .animate-pulse-glow,
+  .glass-panel-hover-purple,
+  .animate-laser-sweep,
+  .animate-spider-idle,
+  .animate-point-nudge {
+    animation: none !important;
+    transition: none !important;
+    transform: none !important;
+  }
+}

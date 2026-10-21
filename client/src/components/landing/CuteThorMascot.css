@@ -1,0 +1,80 @@
+/* Scoped to the guide artwork; existing demo layout and controls stay in place. */
+.rv-thor.rv-thor-chibi {
+  isolation: isolate;
+}
+
+.rv-thor.rv-thor-chibi::before {
+  content: '';
+  position: absolute;
+  inset: 18px 12px 3px 0;
+  z-index: -1;
+  border-radius: 50%;
+  background: radial-gradient(ellipse, #6bcfff21, #a679ff0c 50%, transparent 72%);
+  pointer-events: none;
+}
+
+.rv-thor-chibi .rv-thor-figure {
+  position: absolute;
+  left: -3px;
+  bottom: -3px;
+  width: 100%;
+  height: 148px;
+  transform-origin: 50% 90%;
+  animation: rv-thor-guide-float 4.5s ease-in-out infinite;
+}
+
+.rv-thor.rv-thor-chibi img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  object-position: center;
+  scale: -1 1;
+  transform-origin: 50% 50%;
+  mask-image: none;
+  animation: none;
+  filter: drop-shadow(0 8px 9px #0006) drop-shadow(0 0 5px #8edcff25);
+}
+
+.rv-thor.rv-thor-chibi .rv-thor-bubble {
+  top: -17px;
+  left: 9px;
+  padding: 7px 10px;
+  border: 1px solid #b7eaff;
+  border-radius: 12px 12px 12px 3px;
+  background: linear-gradient(135deg, #ffffff, #e4f4ff);
+  color: #25213c;
+  font-size: 10px;
+  letter-spacing: .01em;
+  box-shadow: 0 3px 14px #07101f35, 0 0 14px #7dcfff21;
+}
+
+.rv-thor-guide-spark {
+  position: absolute;
+  top: 61px;
+  right: 1px;
+  color: #c0f3ff;
+  font-size: 13px;
+  text-shadow: 0 0 9px #54caff;
+  animation: rv-thor-guide-spark 3s ease-in-out infinite;
+}
+
+@keyframes rv-thor-guide-float {
+  0%, 100% { transform: translateY(0) rotate(-1deg); }
+  50% { transform: translateY(-4px) rotate(1deg); }
+}
+
+@keyframes rv-thor-guide-spark {
+  0%, 100% { opacity: .4; scale: .85; }
+  50% { opacity: .95; scale: 1.1; }
+}
+
+@media (max-width: 380px) {
+  .rv-thor-chibi .rv-thor-figure { height: 140px; }
+  .rv-thor.rv-thor-chibi .rv-thor-bubble { left: 5px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rv-thor-chibi .rv-thor-figure,
+  .rv-thor-chibi .rv-thor-guide-spark { animation: none; }
+}
