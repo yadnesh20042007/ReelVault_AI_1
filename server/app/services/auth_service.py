@@ -55,9 +55,14 @@ class AuthService:
             return {"user": data["user"], "session": data, "confirmation_required": False}
         return {"user": data, "session": None, "confirmation_required": True}
 
+    def _is_mock_allowed(self) -> bool:
+        s = get_settings()
+        env = (s.app_env or "dev").lower().strip()
+        return env not in ("prod", "production", "staging")
+
     def sign_in(self, email: str, password: str) -> dict:
         norm_email = email.strip().lower()
-        if norm_email in ("admin", "admin@reelvault.app", "admin@example.com") and password.strip() == "admin":
+        if self._is_mock_allowed() and norm_email in ("admin", "admin@reelvault.app", "admin@example.com") and password.strip() == "admin":
             return {
                 "access_token": "mock_static_admin_token",
                 "refresh_token": "mock_static_admin_refresh_token",
@@ -78,6 +83,8 @@ class AuthService:
 
     def refresh(self, refresh_token: str) -> dict:
         if refresh_token == "mock_static_admin_refresh_token":
+            if not self._is_mock_allowed():
+                raise AuthError("Invalid refresh token.", status=401, code="invalid_credentials")
             return {
                 "access_token": "mock_static_admin_token",
                 "refresh_token": "mock_static_admin_refresh_token",
@@ -98,6 +105,8 @@ class AuthService:
 
     def sign_out(self, access_token: str, *, all_devices: bool = False) -> None:
         if access_token == "mock_static_admin_token":
+            if not self._is_mock_allowed():
+                raise Unauthorized("invalid or expired token")
             return
 
         scope = "global" if all_devices else "local"
@@ -107,6 +116,8 @@ class AuthService:
 
     def get_user(self, access_token: str) -> dict:
         if access_token == "mock_static_admin_token":
+            if not self._is_mock_allowed():
+                raise Unauthorized("invalid or expired token")
             return {"id": "usr_static_admin", "email": "admin@reelvault.app"}
 
         r = self.http.get(f"{self.base}/user", headers=self._headers(access_token))
