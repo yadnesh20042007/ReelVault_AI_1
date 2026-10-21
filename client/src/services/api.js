@@ -17,11 +17,23 @@ export {
 export const DEPLOYED_BACKEND_URL = 'https://reel-vault-7r89.vercel.app';
 export const LOCAL_BACKEND_URLS = ['http://127.0.0.1:8000', 'http://localhost:8000'];
 
-const PRIMARY_URL = (import.meta.env.VITE_API_BASE_URL || DEPLOYED_BACKEND_URL).replace(/\/$/, '');
+const isLocalhost = typeof window !== 'undefined' &&
+  (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+
+const envBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim();
+
+// When running locally in dev mode, default to the local backend so developers
+// are never accidentally routed to a remote deployed backend with mismatched credentials.
+const DEFAULT_PRIMARY = (isLocalhost || import.meta.env.DEV)
+  ? LOCAL_BACKEND_URLS[0]
+  : DEPLOYED_BACKEND_URL;
+
+const PRIMARY_URL = (envBaseUrl || DEFAULT_PRIMARY).replace(/\/$/, '');
 
 export const CANDIDATE_BACKEND_URLS = Array.from(
   new Set([
     PRIMARY_URL,
+    ...(isLocalhost || import.meta.env.DEV ? LOCAL_BACKEND_URLS : []),
     DEPLOYED_BACKEND_URL,
     ...LOCAL_BACKEND_URLS,
   ].filter(Boolean))
@@ -52,7 +64,7 @@ export async function checkBackendHealth(baseUrl, timeoutMs = 2500) {
 
 /**
  * Discovers and returns the active API base URL.
- * Checks the deployed backend first; if unreachable, falls back to local host.
+ * In development, prioritizes local backend candidates; falls back to deployed URL if needed.
  */
 export async function resolveApiBaseUrl(force = false) {
   if (cachedBaseUrl && !force) {
@@ -63,7 +75,7 @@ export async function resolveApiBaseUrl(force = false) {
   }
 
   resolvePromise = (async () => {
-    // 1. Check deployed backend first, then local host candidates
+    // Check candidates in prioritized order
     for (const url of CANDIDATE_BACKEND_URLS) {
       const isAlive = await checkBackendHealth(url);
       if (isAlive) {
@@ -77,7 +89,7 @@ export async function resolveApiBaseUrl(force = false) {
       }
     }
 
-    // If all health checks fail, default to primary/deployed URL
+    // If all health checks fail, default to primary URL
     console.warn(`[ReelVault API] Health checks failed for all candidates. Defaulting to: ${PRIMARY_URL}`);
     cachedBaseUrl = PRIMARY_URL;
     return cachedBaseUrl;
@@ -221,11 +233,15 @@ async function request(path, { method = 'GET', body, auth = true, retry = true }
       }
     }
 
-    if (auth && retry && response.status === 401 && session?.refresh_token) {
-      try {
-        session = await refreshSession(session);
-        response = await doSend(baseUrl);
-      } catch {
+    if (auth && response.status === 401) {
+      if (retry && session?.refresh_token) {
+        try {
+          session = await refreshSession(session);
+          response = await doSend(baseUrl);
+        } catch {
+          clearSession();
+        }
+      } else {
         clearSession();
       }
     }

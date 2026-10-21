@@ -33,12 +33,16 @@ export function AuthProvider({ children }) {
     isMock,
     loading,
     async signIn(email, password) {
+      clearSession();
+      setSessionState(null);
       const next = await api.signIn(email, password);
       setSession(next);
       setSessionState(next);
       return next;
     },
     async signUp(email, password) {
+      clearSession();
+      setSessionState(null);
       const result = await api.signUp(email, password);
       if (result.session) {
         setSession(result.session);

@@ -28,7 +28,15 @@ export function isStaticAdmin(email, password) {
 }
 
 export function isMockSession(session) {
-  return Boolean(session?.is_mock || session?.access_token === 'mock_static_admin_token');
+  let s = session;
+  if (s === undefined && typeof localStorage !== 'undefined') {
+    try {
+      s = JSON.parse(localStorage.getItem('reelvault_session') || 'null');
+    } catch {
+      s = null;
+    }
+  }
+  return Boolean(s?.is_mock || s?.access_token === 'mock_static_admin_token');
 }
 
 const INITIAL_REELS = [
