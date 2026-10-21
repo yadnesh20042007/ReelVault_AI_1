@@ -3,20 +3,25 @@ import { useNavigate } from 'react-router-dom';
 import {
   ArrowRight,
   AlertCircle,
+  AlertTriangle,
   CalendarDays,
   CheckCircle2,
+  Clock,
   EyeOff,
   FileSearch,
   Link as LinkIcon,
   LoaderCircle,
+  RefreshCw,
   ScanText,
   SearchCheck,
+  ShieldAlert,
   Sparkles,
   XCircle,
 } from 'lucide-react';
 import Button from '../components/ui/Button';
 import { api, ApiError } from '../services/api';
 import { useLanguage } from '../preferences/LanguageContext';
+import FiveStageVerification from '../components/verification/FiveStageVerification';
 const ANALYSIS_STEPS = [
   { label: 'Extracting reel content', detail: 'Reading the public post and caption.', Icon: FileSearch },
   { label: 'Transcribing the reel', detail: 'Turning spoken content into searchable text.', Icon: ScanText },
@@ -53,9 +58,10 @@ function AnalysisProgress({ step, complete }) {
 }
 
 export default function Home() {
+  const [activeTab, setActiveTab] = useState('url'); // 'url' | 'rvpack'
   const [inputValue, setInputValue] = useState('');
   const [urlError, setUrlError] = useState('');
-  const [submitError, setSubmitError] = useState('');
+  const [submitError, setSubmitError] = useState(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [analysisStep, setAnalysisStep] = useState(0);
   const [analysisComplete, setAnalysisComplete] = useState(false);
@@ -131,7 +137,7 @@ export default function Home() {
     const error = validateUrl(inputValue);
     setUrlError(error);
     if (error) return;
-    setSubmitError('');
+    setSubmitError(null);
     setAnalysisStep(0);
     setAnalysisComplete(false);
     setIsSubmitting(true);
@@ -142,75 +148,181 @@ export default function Home() {
       loadRecent();
       navigate('/vault');
     } catch (requestError) {
-      setSubmitError(requestError instanceof ApiError ? requestError.message : 'Unable to save this reel.');
+      if (requestError instanceof ApiError) {
+        setSubmitError({
+          message: requestError.message,
+          code: requestError.code || 'unknown',
+          status: requestError.status,
+        });
+      } else {
+        setSubmitError({
+          message: requestError?.message || 'Unable to save this reel.',
+          code: 'unknown',
+          status: 500,
+        });
+      }
     } finally {
       setIsSubmitting(false);
     }
   };
 
   return (
-    <div className="w-full space-y-12 pb-8">
-      <header className="max-w-2xl">
+    <div className="w-full space-y-8 pb-8">
+      <header className="max-w-3xl">
         <h1 className="font-display text-4xl sm:text-5xl uppercase tracking-wide text-[#261B33] mb-3">
-          SAVE A REEL
+          {activeTab === 'url' ? 'SAVE A REEL' : 'FIVE-STAGE VERIFICATION'}
         </h1>
         <p className="text-[#776A83] font-medium text-lg">
-          Paste a public Instagram, YouTube, or TikTok link. We fetch the title and transcript and store it in your vault.
+          {activeTab === 'url'
+            ? 'Paste a public Instagram, YouTube, or TikTok link. We fetch the title and transcript and store it in your vault.'
+            : 'Submit a .rvpack package (TRANSCRIPT, ON_SCREEN, META) to run the five-stage verification pipeline with official evidence checking.'}
         </p>
+
+        {/* Tab Switcher */}
+        <div className="flex items-center gap-2 mt-6 p-1.5 rounded-2xl bg-white border border-[#E3D4F8] w-fit shadow-xs">
+          <button
+            type="button"
+            onClick={() => setActiveTab('url')}
+            className={`px-4 py-2 text-xs sm:text-sm font-bold rounded-xl transition-all cursor-pointer ${
+              activeTab === 'url'
+                ? 'bg-[#8B5CF6] text-white shadow-sm shadow-[#8B5CF6]/30'
+                : 'text-[#776A83] hover:text-[#261B33] hover:bg-[#F0E8FF]/60'
+            }`}
+          >
+            📹 Save Reel URL
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('rvpack')}
+            className={`px-4 py-2 text-xs sm:text-sm font-bold rounded-xl transition-all cursor-pointer ${
+              activeTab === 'rvpack'
+                ? 'bg-[#8B5CF6] text-white shadow-sm shadow-[#8B5CF6]/30'
+                : 'text-[#776A83] hover:text-[#261B33] hover:bg-[#F0E8FF]/60'
+            }`}
+          >
+            🛡️ 5-Stage Verification (.rvpack)
+          </button>
+        </div>
       </header>
 
-      <section className="w-full">
-        <div className="bg-white rounded-3xl p-6 sm:p-8 lg:p-10 shadow-[0_8px_30px_-6px_rgba(139,92,246,0.06)] border border-[#E3D4F8]">
-          <form onSubmit={handleSubmit} className="space-y-6">
-            <div className="p-5 sm:p-7 rounded-2xl border-2 border-dashed border-[#E3D4F8] bg-[#FBF7FD]/70 hover:border-[#8B5CF6]/50 transition-colors space-y-4">
-              <label className="text-[11px] font-bold uppercase tracking-widest text-[#776A83] ml-1 block">
-                REEL / SHORT LINK
-              </label>
-              <div className="relative">
-                <div className="absolute inset-y-0 left-0 pl-5 flex items-center pointer-events-none">
-                  <LinkIcon size={18} className="text-[#8B5CF6]" />
+      {activeTab === 'rvpack' ? (
+        <section className="w-full">
+          <div className="bg-white rounded-3xl p-6 sm:p-8 lg:p-10 shadow-[0_8px_30px_-6px_rgba(139,92,246,0.06)] border border-[#E3D4F8]">
+            <FiveStageVerification />
+          </div>
+        </section>
+      ) : (
+        <>
+          <section className="w-full">
+            <div className="bg-white rounded-3xl p-6 sm:p-8 lg:p-10 shadow-[0_8px_30px_-6px_rgba(139,92,246,0.06)] border border-[#E3D4F8]">
+              <form onSubmit={handleSubmit} className="space-y-6">
+                <div className="p-5 sm:p-7 rounded-2xl border-2 border-dashed border-[#E3D4F8] bg-[#FBF7FD]/70 hover:border-[#8B5CF6]/50 transition-colors space-y-4">
+                  <label className="text-[11px] font-bold uppercase tracking-widest text-[#776A83] ml-1 block">
+                    REEL / SHORT LINK
+                  </label>
+                  <div className="relative">
+                    <div className="absolute inset-y-0 left-0 pl-5 flex items-center pointer-events-none">
+                      <LinkIcon size={18} className="text-[#8B5CF6]" />
+                    </div>
+                    <input
+                      type="url"
+                      placeholder="https://www.instagram.com/reel/..."
+                      value={inputValue}
+                      disabled={isSubmitting}
+                      onChange={(e) => { setInputValue(e.target.value); setUrlError(''); setSubmitError(null); }}
+                      className={`w-full pl-12 pr-5 py-4 bg-white border ${urlError && urlError !== 'empty' ? 'border-red-400 focus:border-red-500 focus:ring-red-500/20' : 'border-[#E3D4F8] focus:border-[#8B5CF6] focus:ring-[#8B5CF6]/20'} rounded-2xl text-[#261B33] placeholder:text-[#776A83]/40 focus:outline-none focus:ring-2 transition-all text-base font-medium shadow-2xs`}
+                    />
+                  </div>
+                  {urlError === 'invalid' && (
+                    <div className="flex items-center gap-1.5 text-red-500 text-sm font-medium mt-2 ml-1">
+                      <AlertCircle size={14} /> Enter a valid URL.
+                    </div>
+                  )}
+                  {urlError === 'unsupported' && (
+                    <div className="flex items-center gap-1.5 text-amber-600 text-sm font-medium mt-2 ml-1">
+                      <AlertCircle size={14} /> This link isn't supported yet.
+                    </div>
+                  )}
+                  {submitError && (
+                    <div
+                      className={`p-4 rounded-2xl border flex items-start gap-3 mt-3 transition-all ${
+                        submitError?.code === 'provider_auth_failed'
+                          ? 'bg-rose-50/80 border-rose-200 text-rose-900'
+                          : submitError?.code === 'provider_credits_exhausted'
+                          ? 'bg-amber-50/80 border-amber-200 text-amber-900'
+                          : submitError?.code === 'provider_rate_limited'
+                          ? 'bg-orange-50/80 border-orange-200 text-orange-900'
+                          : submitError?.code === 'provider_post_unavailable'
+                          ? 'bg-purple-50/80 border-purple-200 text-purple-900'
+                          : 'bg-red-50/80 border-red-200 text-red-900'
+                      }`}
+                    >
+                      <div className="mt-0.5 shrink-0">
+                        {submitError?.code === 'provider_auth_failed' ? (
+                          <ShieldAlert size={18} className="text-rose-600" />
+                        ) : submitError?.code === 'provider_credits_exhausted' ? (
+                          <AlertTriangle size={18} className="text-amber-600" />
+                        ) : submitError?.code === 'provider_rate_limited' ? (
+                          <Clock size={18} className="text-orange-600" />
+                        ) : submitError?.code === 'provider_unavailable' ? (
+                          <RefreshCw size={18} className="text-indigo-600" />
+                        ) : (
+                          <AlertCircle size={18} className="text-red-600" />
+                        )}
+                      </div>
+                      <div className="space-y-1 text-sm">
+                        <div className="flex items-center gap-2">
+                          <span
+                            className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full ${
+                              submitError?.code === 'provider_auth_failed'
+                                ? 'bg-rose-200/60 text-rose-800'
+                                : submitError?.code === 'provider_credits_exhausted'
+                                ? 'bg-amber-200/60 text-amber-800'
+                                : submitError?.code === 'provider_rate_limited'
+                                ? 'bg-orange-200/60 text-orange-800'
+                                : submitError?.code === 'provider_post_unavailable'
+                                ? 'bg-purple-200/60 text-purple-800'
+                                : submitError?.code === 'provider_unavailable'
+                                ? 'bg-indigo-200/60 text-indigo-800'
+                                : 'bg-red-200/60 text-red-800'
+                            }`}
+                          >
+                            {submitError?.code === 'provider_auth_failed'
+                              ? 'API Key / Access Denied'
+                              : submitError?.code === 'provider_credits_exhausted'
+                              ? 'Credits Exhausted'
+                              : submitError?.code === 'provider_rate_limited'
+                              ? 'Rate Limited'
+                              : submitError?.code === 'provider_post_unavailable'
+                              ? 'Content Unavailable'
+                              : submitError?.code === 'provider_unavailable'
+                              ? 'Provider Offline'
+                              : 'Error'}
+                          </span>
+                        </div>
+                        <p className="font-medium text-xs sm:text-sm leading-relaxed">
+                          {typeof submitError === 'string' ? submitError : submitError.message}
+                        </p>
+                      </div>
+                    </div>
+                  )}
                 </div>
-                <input
-                  type="url"
-                  placeholder="https://www.instagram.com/reel/..."
-                  value={inputValue}
-                  disabled={isSubmitting}
-                  onChange={(e) => { setInputValue(e.target.value); setUrlError(''); setSubmitError(''); }}
-                  className={`w-full pl-12 pr-5 py-4 bg-white border ${urlError && urlError !== 'empty' ? 'border-red-400 focus:border-red-500 focus:ring-red-500/20' : 'border-[#E3D4F8] focus:border-[#8B5CF6] focus:ring-[#8B5CF6]/20'} rounded-2xl text-[#261B33] placeholder:text-[#776A83]/40 focus:outline-none focus:ring-2 transition-all text-base font-medium shadow-2xs`}
-                />
-              </div>
-              {urlError === 'invalid' && (
-                <div className="flex items-center gap-1.5 text-red-500 text-sm font-medium mt-2 ml-1">
-                  <AlertCircle size={14} /> Enter a valid URL.
-                </div>
-              )}
-              {urlError === 'unsupported' && (
-                <div className="flex items-center gap-1.5 text-amber-600 text-sm font-medium mt-2 ml-1">
-                  <AlertCircle size={14} /> This link isn't supported yet.
-                </div>
-              )}
-              {submitError && (
-                <div className="flex items-center gap-1.5 text-red-500 text-sm font-medium mt-2 ml-1">
-                  <AlertCircle size={14} /> {submitError}
-                </div>
-              )}
+
+                {isSubmitting ? (
+                  <AnalysisProgress step={analysisStep} complete={analysisComplete} />
+                ) : (
+                  <Button
+                    type="submit"
+                    className="w-full bg-gradient-to-r from-[#8B5CF6] to-[#6D28D9] hover:from-[#7C3AED] hover:to-[#5B21B6] text-white font-bold py-4 rounded-xl text-base sm:text-lg flex items-center justify-center gap-2 shadow-md shadow-[#8B5CF6]/25 hover:shadow-lg hover:shadow-[#8B5CF6]/35 transition-all cursor-pointer"
+                  >
+                    SAVE & ANALYSE REEL <ArrowRight size={20} strokeWidth={2.5} />
+                  </Button>
+                )}
+              </form>
             </div>
+          </section>
 
-            {isSubmitting ? (
-              <AnalysisProgress step={analysisStep} complete={analysisComplete} />
-            ) : (
-              <Button
-                type="submit"
-                className="w-full bg-gradient-to-r from-[#8B5CF6] to-[#6D28D9] hover:from-[#7C3AED] hover:to-[#5B21B6] text-white font-bold py-4 rounded-xl text-base sm:text-lg flex items-center justify-center gap-2 shadow-md shadow-[#8B5CF6]/25 hover:shadow-lg hover:shadow-[#8B5CF6]/35 transition-all cursor-pointer"
-              >
-                SAVE & ANALYSE REEL <ArrowRight size={20} strokeWidth={2.5} />
-              </Button>
-            )}
-          </form>
-        </div>
-      </section>
-
-      <section className="pt-8 border-t border-[#E3D4F8]/80">
+          <section className="pt-8 border-t border-[#E3D4F8]/80">
         <div className="flex flex-col gap-4 mb-6 sm:flex-row sm:items-end sm:justify-between">
           <div>
             <h2 className="text-sm font-display uppercase tracking-widest text-[#776A83]">Recent</h2>
@@ -277,6 +389,8 @@ export default function Home() {
           </div>
         )}
       </section>
+        </>
+      )}
     </div>
   );
 }

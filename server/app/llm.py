@@ -106,7 +106,7 @@ class MonitoredChatGoogleGenerativeAI(ChatGoogleGenerativeAI):
             raise
 
 
-def _build_model(model_name: str, key: str, max_retries: int):
+def _build_model(model_name: str, key: str, max_retries: int, timeout: float = 30.0):
     # If using Google Gemini model
     if ":" not in model_name or model_name.startswith("google_genai:"):
         clean_model = model_name.split(":", 1)[1] if ":" in model_name else model_name
@@ -116,16 +116,18 @@ def _build_model(model_name: str, key: str, max_retries: int):
             api_key_str=key,
             temperature=0,
             max_retries=max_retries,
+            timeout=timeout,
         )
     return init_chat_model(
         model_name,
         api_key=key,
         temperature=0,
         max_retries=max_retries,
+        timeout=timeout,
     )
 
 
-def get_llm(kind: Literal["fast", "main"] = "main"):
+def get_llm(kind: Literal["fast", "main"] = "main", timeout: float | None = None):
     s = get_settings()
     keys = s.get_all_gemini_keys()
     if not keys:
@@ -137,10 +139,11 @@ def get_llm(kind: Literal["fast", "main"] = "main"):
 
     os.environ.setdefault("GOOGLE_API_KEY", primary_key)
     model = s.llm_model_fast if kind == "fast" else s.llm_model_main
+    http_timeout = timeout if timeout is not None else getattr(s, "gemini_http_timeout_s", 30.0)
 
-    primary = _build_model(model, primary_key, s.llm_max_retries)
+    primary = _build_model(model, primary_key, s.llm_max_retries, timeout=http_timeout)
     if not fallback_keys:
         return primary
 
-    fallbacks = [_build_model(model, k, s.llm_max_retries) for k in fallback_keys]
+    fallbacks = [_build_model(model, k, s.llm_max_retries, timeout=http_timeout) for k in fallback_keys]
     return primary.with_fallbacks(fallbacks)

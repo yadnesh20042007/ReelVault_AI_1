@@ -403,4 +403,40 @@ export const api = {
     if (isMockSession()) return mockStore.deleteLinkVaultEntry(entryId);
     return request(`/v1/reels/link-vault/${entryId}`, { method: 'DELETE' });
   },
+
+  submitRVPack: async (content, reel_id = null) => {
+    if (isMockSession()) {
+      return mockStore.submitRVPack(content, reel_id);
+    }
+    return request('/v1/verification/rvpack', {
+      method: 'POST',
+      body: { content, reel_id },
+    });
+  },
+
+  getVerificationRun: async (runId) => {
+    if (isMockSession()) {
+      return mockStore.getVerificationRun(runId);
+    }
+    return request(`/v1/verification/runs/${runId}`);
+  },
+
+  resumeVerificationRun: async (runId) => {
+    if (isMockSession()) {
+      return mockStore.resumeVerificationRun(runId);
+    }
+    return request(`/v1/verification/runs/${runId}/resume`, {
+      method: 'POST',
+    });
+  },
+
+  connectVaultReminder: async (runId, body = {}) => {
+    if (isMockSession()) {
+      return mockStore.connectVaultReminder(runId, body);
+    }
+    return request(`/v1/verification/runs/${runId}/connect-vault-reminder`, {
+      method: 'POST',
+      body,
+    });
+  },
 };

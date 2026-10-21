@@ -737,5 +737,194 @@ export const mockStore = {
       sources: mockSources,
       summary: `Found ${mockSources.length} verified sources via Tavily search platform.`,
     };
-  }
+  },
+
+  submitRVPack: function(content, reelId = null) {
+    const runId = 'mock_run_' + Date.now();
+    const hasFee500 = /500/.test(content);
+    const hasDeadline = /deadline|date/i.test(content);
+    const run = {
+      id: runId,
+      user_id: MOCK_ADMIN_USER.id,
+      user_reel_id: reelId,
+      input_type: 'rvpack',
+      status: 'completed',
+      current_stage: 'completed',
+      completed_stages: ['extracted', 'claims', 'evidence', 'verdict', 'card'],
+      persistence_backend: 'mock_storage',
+      stages: [
+        {
+          id: `stg_1_${runId}`,
+          run_id: runId,
+          stage_name: 'extracted',
+          stage_order: 1,
+          status: 'completed',
+          payload: {
+            title: 'National AI Hackathon 2026',
+            organizer: 'IIT Bombay',
+            category: 'hackathon',
+            has_fee: hasFee500,
+            is_fee_warning: hasFee500,
+            fee_raw: hasFee500 ? '₹500' : null,
+            fee_warning_message: hasFee500 ? 'Registration fee detected (₹500). Verify the organizer\'s identity, official event page, payment recipient, and refund policy before paying. A fee alone does not establish fraud.' : null,
+            deadline: {
+              raw: '15th December 2026',
+              date: '2026-12-15',
+              year_ambiguous: false,
+              reminder_eligible: true,
+              vault_reminder_status: 'ready_to_connect',
+            },
+            links: ['https://iitb.ac.in/hackathon'],
+          },
+          created_at: new Date().toISOString(),
+        },
+        {
+          id: `stg_2_${runId}`,
+          run_id: runId,
+          stage_name: 'claims',
+          stage_order: 2,
+          status: 'completed',
+          payload: {
+            claims: [
+              { claim_id: 'c1', claim_text: 'The opportunity is organized by IIT Bombay.', claim_type: 'organizer', is_fee_warning_claim: false },
+              { claim_id: 'c2', claim_text: 'Application deadline is 15th December 2026.', claim_type: 'deadline', is_fee_warning_claim: false },
+              ...(hasFee500 ? [{ claim_id: 'c3', claim_text: 'Registration fee of ₹500 is required.', claim_type: 'fee', is_fee_warning_claim: true }] : []),
+            ],
+            total_claims: hasFee500 ? 3 : 2,
+          },
+          created_at: new Date().toISOString(),
+        },
+        {
+          id: `stg_3_${runId}`,
+          run_id: runId,
+          stage_name: 'evidence',
+          stage_order: 3,
+          status: 'completed',
+          payload: {
+            evidence_items: [
+              {
+                id: 'ev1',
+                claim_ids: ['c1'],
+                url: 'https://iitb.ac.in/hackathon',
+                title: 'IIT Bombay Official Portal',
+                snippet: 'Official hackathon details hosted on verified ac.in academic portal.',
+                domain: 'iitb.ac.in',
+                domain_trust: 'high',
+              },
+            ],
+            queries_used: ['IIT Bombay National AI Hackathon official apply'],
+            official_domains: ['iitb.ac.in'],
+          },
+          created_at: new Date().toISOString(),
+        },
+        {
+          id: `stg_4_${runId}`,
+          run_id: runId,
+          stage_name: 'verdict',
+          stage_order: 4,
+          status: 'completed',
+          payload: {
+            claim_verdicts: [
+              { claim_id: 'c1', claim_text: 'The opportunity is organized by IIT Bombay.', verdict: 'supported', explanation: 'Matches official high-trust academic domain.' },
+              { claim_id: 'c2', claim_text: 'Application deadline is 15th December 2026.', verdict: 'supported', explanation: 'Corroborated by portal timeline.' },
+              ...(hasFee500 ? [{ claim_id: 'c3', claim_text: 'Registration fee of ₹500 is required.', verdict: 'supported', explanation: 'Registration fee confirmed in official announcement. A fee alone does not establish fraud.', is_fee_warning_claim: true }] : []),
+            ],
+            overall_verdict: 'supported',
+            summary: 'Opportunity claims are supported by official academic portal records.' + (hasFee500 ? ' Registration fee detected (₹500); verify official organizer details before paying.' : ''),
+            scam_warnings: hasFee500 ? ['Registration fee detected (₹500). Verify the organizer\'s identity, official event page, payment recipient, and refund policy before paying. A fee alone does not establish fraud.'] : [],
+            has_scam_warning: hasFee500,
+            fraudulent_detected: false,
+          },
+          created_at: new Date().toISOString(),
+        },
+        {
+          id: `stg_5_${runId}`,
+          run_id: runId,
+          stage_name: 'card',
+          stage_order: 5,
+          status: 'completed',
+          payload: {
+            card_id: `card_${runId}`,
+            run_id: runId,
+            title: 'IIT Bombay AI Hackathon 2026',
+            organizer: 'IIT Bombay',
+            category: 'hackathon',
+            overall_verdict: 'supported',
+            badge: 'OFFICIAL VERIFIED',
+            scam_warnings: hasFee500 ? ['Registration fee detected (₹500). Verify the organizer\'s identity, official event page, payment recipient, and refund policy before paying. A fee alone does not establish fraud.'] : [],
+            deadline: {
+              raw: '15th December 2026',
+              date: '2026-12-15',
+              year_ambiguous: false,
+              reminder_eligible: true,
+              vault_reminder_status: 'ready_to_connect',
+            },
+            can_save_reminder: true,
+            stages_verified: ['extracted', 'claims', 'evidence', 'verdict'],
+            created_at: new Date().toISOString(),
+          },
+          created_at: new Date().toISOString(),
+        },
+      ],
+      card: {
+        card_id: `card_${runId}`,
+        run_id: runId,
+        title: 'IIT Bombay AI Hackathon 2026',
+        organizer: 'IIT Bombay',
+        category: 'hackathon',
+        overall_verdict: 'supported',
+        badge: 'OFFICIAL VERIFIED',
+        scam_warnings: hasFee500 ? ['Registration fee detected (₹500). Verify the organizer\'s identity, official event page, payment recipient, and refund policy before paying. A fee alone does not establish fraud.'] : [],
+        deadline: {
+          raw: '15th December 2026',
+          date: '2026-12-15',
+          year_ambiguous: false,
+          reminder_eligible: true,
+          vault_reminder_status: 'ready_to_connect',
+        },
+        can_save_reminder: true,
+        stages_verified: ['extracted', 'claims', 'evidence', 'verdict'],
+        created_at: new Date().toISOString(),
+      },
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    try {
+      const stored = JSON.parse(localStorage.getItem('reelvault_mock_runs') || '{}');
+      stored[runId] = run;
+      localStorage.setItem('reelvault_mock_runs', JSON.stringify(stored));
+    } catch {
+      // storage unavailable
+    }
+    return run;
+  },
+
+  getVerificationRun: function(runId) {
+    try {
+      const stored = JSON.parse(localStorage.getItem('reelvault_mock_runs') || '{}');
+      if (stored[runId]) return stored[runId];
+    } catch {
+      // Ignore corrupted localStorage in mock fallback
+    }
+    return this.submitRVPack('---TRANSCRIPT---\nDemo Opportunity\n---ON_SCREEN---\nDemo\n---META---\nauthor: Demo\n');
+  },
+
+  resumeVerificationRun: function(runId) {
+    return this.getVerificationRun(runId);
+  },
+
+  connectVaultReminder: function(runId, body = {}) {
+    const eventDate = body.event_date || '2026-12-15';
+    const label = body.label || 'Deadline: IIT Bombay AI Hackathon';
+    this.saveDate(body.reel_id || 1, { label, event_date: eventDate });
+    return {
+      success: true,
+      saved_date_id: Date.now(),
+      reel_id: body.reel_id || 1,
+      label,
+      event_date: eventDate,
+      status: 'connected',
+      message: `Deadline reminder successfully connected to Vault for ${eventDate}.`,
+    };
+  },
 };
