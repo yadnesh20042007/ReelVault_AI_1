@@ -3,7 +3,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import auth, health, reels
+from app.api import auth, health, reels, verification
 from app.config import get_settings
 from app.db import repo
 from app.errors import register_error_handlers
@@ -25,6 +25,7 @@ register_error_handlers(app)
 app.include_router(health.router)
 app.include_router(auth.router, prefix="/v1")
 app.include_router(reels.router, prefix="/v1")
+app.include_router(verification.router, prefix="/v1")
 
 
 @app.on_event("startup")

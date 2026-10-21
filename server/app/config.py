@@ -43,11 +43,13 @@ class Settings(BaseSettings):
     gemini_api_key_2: str = ""
     gemini_api_key_3: str = ""
     gemini_api_keys: list[str] | str = []
-    llm_model_fast: str = "gemini-3.5-flash-lite"
-    llm_model_main: str = "gemini-3.5-flash-lite"
+    llm_model_fast: str = "gemini-3-flash-preview"
+    llm_model_main: str = "gemini-3-flash-preview"
     # Fail fast per key so we can immediately rotate/fallback to the next
     # configured key when a quota limit or rate limit is reached.
     llm_max_retries: int = 0
+    gemini_http_timeout_s: float = 30.0
+    workflow_watchdog_timeout_s: float = 35.0
 
     shallow_per_day: int = 50
     deep_per_day: int = 10
@@ -137,6 +139,27 @@ class Settings(BaseSettings):
         return self
 
 
+_last_env_mtime: float = -1.0
+
+
 @lru_cache
-def get_settings() -> Settings:
+def _get_cached_settings() -> Settings:
     return Settings()
+
+
+def get_settings() -> Settings:
+    """Return application settings, refreshing cache automatically if .env was modified on disk."""
+    global _last_env_mtime
+    current_mtime = 0.0
+    if _ENV_FILE.exists():
+        try:
+            current_mtime = _ENV_FILE.stat().st_mtime
+        except OSError:
+            pass
+    if current_mtime != _last_env_mtime:
+        _get_cached_settings.cache_clear()
+        _last_env_mtime = current_mtime
+    return _get_cached_settings()
+
+
+get_settings.cache_clear = _get_cached_settings.cache_clear

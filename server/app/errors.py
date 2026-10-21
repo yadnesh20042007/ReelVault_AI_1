@@ -40,6 +40,34 @@ class UpstreamFailed(AppError):
     status, code = 502, "upstream_failed"
 
 
+class ProviderTimeout(AppError):
+    status, code = 504, "provider_timeout"
+
+
+class ProviderUnavailable(AppError):
+    status, code = 503, "provider_unavailable"
+
+
+class TranscriptProviderAuthError(AppError):
+    status, code = 502, "provider_auth_failed"
+
+
+class TranscriptCreditsExhausted(AppError):
+    status, code = 502, "provider_credits_exhausted"
+
+
+class TranscriptRateLimited(AppError):
+    status, code = 429, "provider_rate_limited"
+
+
+class TranscriptPostUnavailable(AppError):
+    status, code = 422, "provider_post_unavailable"
+
+
+class TranscriptTemporaryError(AppError):
+    status, code = 503, "provider_unavailable"
+
+
 class AuthError(AppError):
     status, code = 400, "auth_error"
 
