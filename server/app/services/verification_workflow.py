@@ -1,17 +1,19 @@
 import concurrent.futures
+import json
 import logging
 import re
 import time
 from datetime import datetime, timezone
 from typing import Any
 
-from pydantic import BaseModel
+from google.api_core.exceptions import ResourceExhausted, TooManyRequests
+from pydantic import BaseModel, ValidationError
 
 from app.config import get_settings
 from app.db import repo as main_repo
 from app.db import verification_repo
 from app.errors import AppError, PipelineError, ProviderTimeout
-from app.llm import get_llm
+from app.llm import _is_key_or_quota_error, get_llm
 from app.schemas.verification import (
     ClaimItem,
     ClaimVerdictItem,
@@ -61,12 +63,15 @@ def _classify_gemini_error(exc: Exception) -> tuple[bool, int, str, str]:
             "Gemini model request timed out (504 DEADLINE_EXCEEDED). You can retry or resume this verification run.",
         )
 
-    msg = str(exc).lower()
+    if isinstance(exc, (ResourceExhausted, TooManyRequests)):
+        return (
+            True,
+            429,
+            "gemini_rate_limited",
+            "Gemini API rate limit reached. Please wait a moment and resume.",
+        )
 
-    # Distinguish malformed output / schema parse failures: these are NOT transient provider errors
-    is_schema_parse = any(p in msg for p in ("schema parse", "outputparser", "jsondecodeerror", "validation error"))
-    if is_schema_parse:
-        return False, 422, "malformed_model_output", f"Model produced malformed or invalid output: {exc}"
+    msg = str(exc).lower()
 
     # 1. 504 / DEADLINE_EXCEEDED / Timeout
     if any(k in msg for k in ("504", "deadline_exceeded", "deadline exceeded", "timed out", "timeout")):
@@ -77,7 +82,12 @@ def _classify_gemini_error(exc: Exception) -> tuple[bool, int, str, str]:
             "Gemini model request timed out (504 DEADLINE_EXCEEDED). You can retry or resume this verification run.",
         )
 
-    # 2. 429 / Rate limit / Resource exhausted
+    # 2. Distinguish malformed output / schema parse failures: these are NOT transient provider errors
+    is_schema_parse = any(p in msg for p in ("schema parse", "outputparser", "jsondecodeerror", "validation error"))
+    if is_schema_parse:
+        return False, 422, "malformed_model_output", f"Model produced malformed or invalid output: {exc}"
+
+    # 3. 429 / Rate limit / Resource exhausted
     if any(k in msg for k in ("429", "resource_exhausted", "resourceexhausted", "quota", "rate limit", "too many requests")):
         return (
             True,
@@ -86,7 +96,16 @@ def _classify_gemini_error(exc: Exception) -> tuple[bool, int, str, str]:
             "Gemini API rate limit reached. Please wait a moment and resume.",
         )
 
-    # 3. 503 / 502 / Service unavailable / Server errors
+    # 4. Authentication / Key errors
+    if any(k in msg for k in ("api_key_invalid", "unauthenticated", "invalid api key")):
+        return (
+            False,
+            401,
+            "gemini_auth_error",
+            "Invalid or unauthenticated Gemini API key.",
+        )
+
+    # 5. 503 / 502 / Service unavailable / Server errors
     if any(k in msg for k in ("503", "unavailable", "service unavailable", "serviceunavailable", "502", "bad gateway")):
         return (
             True,
@@ -96,6 +115,115 @@ def _classify_gemini_error(exc: Exception) -> tuple[bool, int, str, str]:
         )
 
     return False, 500, "gemini_error", str(exc)
+
+
+def _parse_and_validate_structured_output(raw_output: Any, schema: type[BaseModel]) -> Any:
+    """Safely parse and validate model output into the requested Pydantic schema."""
+    if raw_output is None:
+        raise AppError(
+            f"Gemini returned None instead of a structured {schema.__name__} response. "
+            "This typically indicates the model produced an empty response. "
+            "Retry or check model availability.",
+            status=422,
+            code="malformed_model_output",
+        )
+
+    if isinstance(raw_output, schema):
+        return raw_output
+
+    if isinstance(raw_output, dict):
+        try:
+            return schema.model_validate(raw_output)
+        except ValidationError as exc:
+            raise AppError(
+                f"Model output did not conform to schema {schema.__name__}: {exc}",
+                status=422,
+                code="malformed_model_output",
+            ) from exc
+
+    # Handle AIMessage or objects with tool_calls
+    tool_calls = getattr(raw_output, "tool_calls", None)
+    if tool_calls and isinstance(tool_calls, list) and len(tool_calls) > 0:
+        tc = tool_calls[0]
+        args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", None)
+        if isinstance(args, dict):
+            try:
+                return schema.model_validate(args)
+            except ValidationError as exc:
+                raise AppError(
+                    f"Model tool call arguments did not conform to schema {schema.__name__}: {exc}",
+                    status=422,
+                    code="malformed_model_output",
+                ) from exc
+        elif isinstance(args, str) and args.strip():
+            try:
+                data = json.loads(args)
+                return schema.model_validate(data)
+            except Exception as exc:
+                raise AppError(
+                    f"Model tool call arguments could not be parsed as valid JSON: {exc}",
+                    status=422,
+                    code="malformed_model_output",
+                ) from exc
+
+    content = getattr(raw_output, "content", raw_output)
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, dict) and "text" in p:
+                parts.append(p["text"])
+        content = "\n".join(parts)
+
+    if not isinstance(content, str) or not content.strip():
+        raise AppError(
+            f"Model returned an empty or whitespace response instead of a structured {schema.__name__}.",
+            status=422,
+            code="malformed_model_output",
+        )
+
+    cleaned = content.strip()
+    if "```" in cleaned:
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
+        if m:
+            cleaned = m.group(1).strip()
+
+    try:
+        data = json.loads(cleaned)
+    except Exception as exc:
+        m = re.search(r"(\{[\s\S]*\})", cleaned)
+        if m:
+            try:
+                data = json.loads(m.group(1))
+            except Exception:
+                raise AppError(
+                    f"Model produced malformed JSON that could not be decoded: {exc}",
+                    status=422,
+                    code="malformed_model_output",
+                ) from exc
+        else:
+            raise AppError(
+                f"Model produced malformed JSON that could not be decoded: {exc}",
+                status=422,
+                code="malformed_model_output",
+            ) from exc
+
+    if not isinstance(data, dict):
+        raise AppError(
+            f"Expected JSON object for schema {schema.__name__}, got {type(data).__name__}.",
+            status=422,
+            code="malformed_model_output",
+        )
+
+    try:
+        return schema.model_validate(data)
+    except ValidationError as exc:
+        raise AppError(
+            f"Model output missing required fields or invalid for schema {schema.__name__}: {exc}",
+            status=422,
+            code="malformed_model_output",
+        ) from exc
 
 
 def _invoke_structured_llm(
@@ -132,8 +260,18 @@ def _invoke_structured_llm(
                     code="llm_unconfigured",
                 )
             llm = get_llm(fallback_kind, timeout=http_timeout)
-            structured_llm = llm.with_structured_output(schema)
-            return structured_llm.invoke(messages)
+            try:
+                structured_llm = llm.with_structured_output(schema)
+                res = structured_llm.invoke(messages)
+            except ValidationError as exc:
+                raise AppError(
+                    f"Model output missing required fields or invalid for schema {schema.__name__}: {exc}",
+                    status=422,
+                    code="malformed_model_output",
+                ) from exc
+            except (NotImplementedError, AttributeError):
+                res = llm.invoke(messages)
+            return _parse_and_validate_structured_output(res, schema)
 
         if hasattr(client, "with_structured_output"):
             try:
@@ -141,15 +279,19 @@ def _invoke_structured_llm(
             except (NotImplementedError, AttributeError):
                 structured = None
             if structured is not None:
-                res = structured.invoke(messages)
-                if isinstance(res, dict):
-                    return schema(**res)
-                return res
+                try:
+                    res = structured.invoke(messages)
+                except ValidationError as exc:
+                    raise AppError(
+                        f"Model output missing required fields or invalid for schema {schema.__name__}: {exc}",
+                        status=422,
+                        code="malformed_model_output",
+                    ) from exc
+                if res is not None:
+                    return _parse_and_validate_structured_output(res, schema)
 
         res = client.invoke(messages)
-        if isinstance(res, dict):
-            return schema(**res)
-        return res
+        return _parse_and_validate_structured_output(res, schema)
 
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
@@ -229,7 +371,7 @@ _MONTH_MAP = {
 }
 
 _DEADLINE_KW_REGEX = re.compile(
-    r"(?:deadline|last\s+date|apply\s+by|due\s+date|register\s+by|registration\s+ends|ends\s+on|closes\s+on|submission\s+deadline)\s*(?:is|:|-)?\s*([^\n.,;]+)",
+    r"(?:deadline|last\s+date|apply\s+by|apply\s+before|register\s+by|register\s+before|due\s+date|registration\s+ends|ends\s+on|closes\s+on|submission\s+deadline)\s*(?:is|:|-)?\s*([^\n.,;]+)",
     re.IGNORECASE,
 )
 
@@ -266,8 +408,9 @@ Guidelines for Semantic Extraction:
 3. Category: Choose accurately from [hackathon, internship, scholarship, competition, course, job, government_scheme, event, other].
 4. Deadline & Ambiguity:
    - Extract any deadline mention.
-   - If a specific calendar year is missing or ambiguous (e.g., "15th November" without a year), set year_ambiguous=True and ambiguity_reason explaining that the year is not stated.
-   - Only populate deadline_date (YYYY-MM-DD) if the date and year are completely unambiguous.
+   - If a posting date is provided in META (e.g. posted: 2026-10-05) and the announcement specifies a month and day (e.g. 31 Oct), resolve the calendar year using the posting date context (e.g. 2026-10-31), set year_ambiguous=False, and populate deadline_date (YYYY-MM-DD).
+   - If a specific calendar year is missing or ambiguous and cannot be resolved, set year_ambiguous=True and ambiguity_reason explaining that the year is not stated.
+   - Only leave deadline_date as null if the date and year cannot be unambiguously resolved.
 5. Registration Fee & Neutral Caution:
    - Check if a fee or payment is required (e.g. ₹500, Rs. 500, $50).
    - If a fee is present, set has_fee=True, is_fee_warning=True, and extract fee_raw.
@@ -280,6 +423,9 @@ Guidelines for Semantic Extraction:
    - Include direct quotes or references from the transcript/on-screen text.
 7. Targeted Web Search Queries:
    - Formulate at most 2 concise, highly targeted search queries to verify these specific claims against external sources (e.g. exact event name + organizer + "official", or registration details).
+8. Output Format:
+   - Return a strictly valid JSON object matching the GeminiClaimAnalysis schema.
+   - Do not include markdown code block formatting or any surrounding conversational text.
 """
 
 VERDICT_SYSTEM_PROMPT = """You are ReelVault's evidence evaluation and verdict engine.
@@ -316,11 +462,37 @@ Verdict Guidelines:
    - "insufficient evidence": When evidence is insufficient to verify the opportunity.
 6. Summary:
    - Grounded summary distinguishing: what the reel claims, what independent sources corroborate, what is contradicted, and what remains unverified.
+7. Output Format:
+   - Return a strictly valid JSON object matching the GeminiVerdictEvaluation schema with this structure:
+     {
+       "claim_verdicts": [
+         {
+           "claim_id": "c1",
+           "claim_text": "Claim text here",
+           "verdict": "supported" | "partially supported" | "contradicted" | "insufficient evidence",
+           "explanation": "Brief factual explanation citing sources",
+           "cited_sources": ["https://..."],
+           "is_fee_warning_claim": false
+         }
+       ],
+       "overall_verdict": "supported" | "partially supported" | "contradicted" | "insufficient evidence",
+       "summary": "Grounded summary of findings",
+       "scam_warnings": [],
+       "has_scam_warning": false,
+       "fraudulent_detected": false
+     }
+   - The fields "claim_verdicts", "overall_verdict", and "summary" are strictly REQUIRED.
+   - Every claim provided in the input MUST have an evaluation item in "claim_verdicts".
+   - Use only the allowed verdict strings: "supported", "partially supported", "contradicted", "insufficient evidence".
+   - Do not include markdown code block formatting or any surrounding conversational text.
 """
 
 
 def _parse_deadline(raw_text: str, meta: dict[str, Any] | None = None) -> DeadlineInfo:
-    """Extract deadline from raw text, explicitly detecting ambiguous year vs unambiguous date."""
+    """Extract deadline from raw text, explicitly detecting ambiguous year vs unambiguous date.
+    
+    If year is not stated in raw text, attempts to resolve calendar year from post metadata (e.g. posted date).
+    """
     match = _DEADLINE_KW_REGEX.search(raw_text)
     if not match:
         month_match = re.search(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_REGEX})(?:\s+(\d{{4}}))?\b", raw_text, re.IGNORECASE)
@@ -339,6 +511,8 @@ def _parse_deadline(raw_text: str, meta: dict[str, Any] | None = None) -> Deadli
     else:
         candidate = match.group(1).strip()
         candidate = re.split(r"[.!?\n]", candidate)[0].strip()
+
+    candidate = re.sub(r"^(?:apply\s+)?(?:before|by|on|is|ends|ends\s+on)\s+", "", candidate, flags=re.IGNORECASE).strip()
 
     # ISO format: YYYY-MM-DD
     iso_match = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", candidate)
@@ -388,12 +562,38 @@ def _parse_deadline(raw_text: str, meta: dict[str, Any] | None = None) -> Deadli
         except ValueError:
             pass
 
-    # Ambiguous year check (e.g. "15th November" without a year)
+    # Ambiguous year check (e.g. "31 Oct" or "15th November" without a year)
     dm_no_year = re.search(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_REGEX})\b", candidate, re.IGNORECASE)
     if not dm_no_year:
         dm_no_year = re.search(rf"\b({_MONTH_REGEX})\s+(\d{{1,2}})(?:st|nd|rd|th)?\b", candidate, re.IGNORECASE)
 
     if dm_no_year:
+        # Check if posting date in meta resolves the ambiguous year
+        if meta and isinstance(meta, dict):
+            posted_val = str(meta.get("posted") or meta.get("date") or meta.get("post_date") or meta.get("created_at") or "").strip()
+            post_year_m = re.search(r"\b(20\d\d)\b", posted_val)
+            if post_year_m:
+                resolved_year = int(post_year_m.group(1))
+                g1 = dm_no_year.group(1).lower().rstrip(".")
+                g2 = dm_no_year.group(2).lower().rstrip(".")
+                if g1 in _MONTH_MAP:
+                    month = _MONTH_MAP[g1]
+                    day = int(re.sub(r"\D", "", g2) or "1")
+                else:
+                    day = int(re.sub(r"\D", "", g1) or "1")
+                    month = _MONTH_MAP.get(g2, 1)
+                try:
+                    d_obj = datetime(resolved_year, month, day)
+                    return DeadlineInfo(
+                        raw=candidate,
+                        date=d_obj.strftime("%Y-%m-%d"),
+                        year_ambiguous=False,
+                        reminder_eligible=True,
+                        vault_reminder_status="ready_to_connect",
+                    )
+                except ValueError:
+                    pass
+
         return DeadlineInfo(
             raw=candidate,
             date=None,
@@ -438,15 +638,17 @@ def is_substantively_relevant(
     if any(ev_url.lower() == u.lower() for u in extracted.links):
         return True, "Direct link submitted with announcement."
 
+    _extracted_title = extracted.title if isinstance(extracted.title, str) else ""
+    _extracted_org = extracted.organizer if isinstance(extracted.organizer, str) else ""
     title_tokens = [
-        w for w in re.findall(r"[a-z0-9]+", extracted.title.lower())
+        w for w in re.findall(r"[a-z0-9]+", _extracted_title.lower())
         if len(w) >= 3 and w not in STOP and w not in GENERIC_OPPORTUNITY_TERMS
     ]
 
-    organizer_clean = (extracted.organizer or "").strip()
+    organizer_clean = _extracted_org.strip()
     organizer_tokens = [
         w for w in re.findall(r"[a-z0-9]+", organizer_clean.lower())
-        if len(w) >= 3 and w not in STOP and organizer_clean != "Unverified organizer"
+        if len(w) >= 3 and w not in STOP and organizer_clean not in ("", "Unverified organizer")
     ]
 
     # Check 1: Unrelated institution rejection
@@ -500,13 +702,15 @@ def match_evidence_to_claims(
 
     text_corpus = f"{ev_title} {ev_snippet} {ev_url}".lower()
 
+    _title_str = extracted.title if isinstance(extracted.title, str) else ""
+    _org_str = extracted.organizer if isinstance(extracted.organizer, str) else ""
     title_words = [
-        w for w in re.findall(r"[a-z0-9]+", extracted.title.lower())
+        w for w in re.findall(r"[a-z0-9]+", _title_str.lower())
         if len(w) >= 3 and w not in STOP and w not in GENERIC_OPPORTUNITY_TERMS
     ]
     org_words = [
-        w for w in re.findall(r"[a-z0-9]+", extracted.organizer.lower())
-        if len(w) >= 3 and w not in STOP and extracted.organizer != "Unverified organizer"
+        w for w in re.findall(r"[a-z0-9]+", _org_str.lower())
+        if len(w) >= 3 and w not in STOP and _org_str not in ("", "Unverified organizer")
     ]
 
     matched_ids: list[str] = []
@@ -557,13 +761,35 @@ def match_evidence_to_claims(
     return matched_ids
 
 
+def _is_usable_url(u: Any) -> bool:
+    """Validate that u is a usable external URL, rejecting None, 'none', 'null', and placeholders."""
+    if not u or not isinstance(u, str):
+        return False
+    cleaned = u.strip().lower()
+    if cleaned in ("none", "null", "n/a", "no", "false", "undefined", "http://none", "https://none", "none/", "null/"):
+        return False
+    if cleaned.startswith(("http://none", "https://none", "http://null", "https://null")):
+        return False
+    # Reject strings without a dot (no domain extension)
+    if not re.search(r"^[a-zA-Z0-9+.-]+://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", cleaned) and not re.search(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", cleaned):
+        return False
+    return True
+
+
 # --- STAGE 1: EXTRACTED ---
 def run_extracted_stage(
     rvpack: RVPackData,
     llm_client: Any = None,
 ) -> ExtractedStagePayload:
     """Stage 1: Semantic extraction & claim decomposition via Gemini API (Call 1)."""
-    meta_author = (rvpack.meta.get("author") or "").strip() or None
+    meta_author = (
+        rvpack.meta.get("author")
+        or rvpack.meta.get("creator")
+        or rvpack.meta.get("source")
+        or rvpack.meta.get("account")
+        or ""
+    ).strip() or None
+    meta_organizer = (rvpack.meta.get("organizer") or "").strip() or None
 
     prompt_sections = [
         "Analyze the following .rvpack opportunity package and provide structured claim analysis:\n",
@@ -597,11 +823,25 @@ def run_extracted_stage(
         log.exception("Gemini claim analysis call failed: %s", exc)
         raise RuntimeError(f"Gemini claim analysis failed: {exc}") from exc
 
+    # Defensive guard: should never be None after _invoke_structured_llm (which now raises AppError
+    # for None responses), but guard here as a belt-and-suspenders safety net.
+    if analysis is None:
+        raise AppError(
+            "Gemini returned no structured analysis. Cannot proceed with verification.",
+            status=422,
+            code="malformed_model_output",
+        )
+
     combined_text = f"{rvpack.transcript}\n{rvpack.on_screen}\n{rvpack.raw_text}"
 
     # 1. Author vs Organizer distinction
-    author = meta_author or analysis.author
-    organizer = (analysis.organizer or "").strip()
+    # analysis.author is Optional[str]; meta_author may also be None when neither
+    # the META section nor the model response provided a creator handle.
+    analysis_author_raw = analysis.author
+    if not isinstance(analysis_author_raw, str):
+        analysis_author_raw = None
+    author = meta_author or (analysis_author_raw.strip() if analysis_author_raw else None) or None
+    organizer = (analysis.organizer if isinstance(analysis.organizer, str) else "").strip()
     if not organizer or organizer.lower() in _GENERIC_ACCOUNT_NAMES or (author and organizer.lower() == author.lower()):
         explicit_org = None
         for pat in [re.compile(r"(?:organized\s+by|organizer|conducted\s+by|presented\s+by|hosted\s+by)\s*[:\-\–]?\s*([A-Za-z0-9&.,'’\s]{2,60})", re.IGNORECASE)]:
@@ -612,13 +852,22 @@ def run_extracted_stage(
                 if cand and not cand.startswith(("@", "http://", "https://", "www.")) and cand.lower() not in _GENERIC_ACCOUNT_NAMES:
                     explicit_org = cand
                     break
-        organizer = explicit_org if explicit_org else "Unverified organizer"
+        organizer = explicit_org or meta_organizer or "Unverified organizer"
 
     # 2. Deadline validation safeguard
     raw_deadline = analysis.deadline_raw
     deadline_date = analysis.deadline_date
     year_ambiguous = analysis.year_ambiguous
     ambiguity_reason = analysis.ambiguity_reason
+
+    # Resolve deadline using posting date in meta if deadline_date is missing or marked ambiguous
+    if (not deadline_date or year_ambiguous) and (raw_deadline or combined_text):
+        parsed_dl = _parse_deadline(raw_deadline or combined_text, rvpack.meta)
+        if parsed_dl.date and not parsed_dl.year_ambiguous:
+            deadline_date = parsed_dl.date
+            raw_deadline = raw_deadline or parsed_dl.raw
+            year_ambiguous = False
+            ambiguity_reason = None
 
     if not raw_deadline and not deadline_date:
         parsed_dl = _parse_deadline(combined_text, rvpack.meta)
@@ -645,10 +894,20 @@ def run_extracted_stage(
         )
 
     # 3. Registration Fee neutral caution safeguard
-    has_fee = analysis.has_fee
-    is_fee_warning = analysis.is_fee_warning
+    has_fee = bool(analysis.has_fee)
+    is_fee_warning = bool(analysis.is_fee_warning)
     fee_raw = analysis.fee_raw
     fee_warning_message = analysis.fee_warning_message
+
+    # Fallback fee detection if LLM missed it
+    if not has_fee:
+        fee_match = re.search(r"(?:₹|rs\.?|inr)\s*(\d+(?:,\d+)*(?:\.\d+)?)|(\d+(?:,\d+)*(?:\.\d+)?)\s*(?:₹|rs\.?|inr|rupees)", combined_text, re.IGNORECASE)
+        fee_kw = re.search(r"(?:fee|registration\s+fee|pay\s+(?:₹|rs\.?|inr)?\s*\d+|registration\s+charge|pay\s*₹?\d+)", combined_text, re.IGNORECASE)
+        if fee_match and fee_kw:
+            has_fee = True
+            is_fee_warning = True
+            if not fee_raw:
+                fee_raw = fee_match.group(0).strip()
 
     if has_fee:
         is_fee_warning = True
@@ -662,13 +921,23 @@ def run_extracted_stage(
     urls: list[str] = []
     seen_urls: set[str] = set()
     for u in (analysis.links or []):
+        if not _is_usable_url(u):
+            continue
         norm = u if u.startswith(("http://", "https://")) else f"https://{u}"
         if norm.lower() not in seen_urls:
             seen_urls.add(norm.lower())
             urls.append(norm)
     for m in _URL_REGEX.finditer(combined_text):
         u = m.group(0).rstrip(".,;:!?)'\"")
+        if not _is_usable_url(u):
+            continue
         norm = u if u.startswith(("http://", "https://")) else f"https://{u}"
+        if norm.lower() not in seen_urls:
+            seen_urls.add(norm.lower())
+            urls.append(norm)
+    meta_url = rvpack.meta.get("url") if isinstance(rvpack.meta, dict) else None
+    if _is_usable_url(meta_url):
+        norm = meta_url if meta_url.startswith(("http://", "https://")) else f"https://{meta_url}"
         if norm.lower() not in seen_urls:
             seen_urls.add(norm.lower())
             urls.append(norm)
@@ -696,16 +965,16 @@ def run_extracted_stage(
     search_queries = analysis.search_queries or []
     if not search_queries:
         target_org = organizer if organizer != "Unverified organizer" else ""
-        search_queries = [f"{target_org} {analysis.title} official".strip()]
+        search_queries = [f"{target_org} {analysis.title or 'opportunity'} official".strip()]
         if has_fee:
-            search_queries.append(f"{target_org} {analysis.title} registration fee".strip())
+            search_queries.append(f"{target_org} {analysis.title or 'opportunity'} registration fee".strip())
     search_queries = search_queries[:2]
 
     return ExtractedStagePayload(
-        title=analysis.title or "Student Opportunity Announcement",
+        title=(analysis.title if isinstance(analysis.title, str) else "").strip() or "Student Opportunity Announcement",
         organizer=organizer,
         author=author,
-        category=analysis.category or "other",
+        category=(analysis.category if isinstance(analysis.category, str) else "").strip() or "other",
         deadline=deadline_info,
         fee_raw=fee_raw,
         has_fee=has_fee,
@@ -918,7 +1187,8 @@ def run_verdict_stage(
         f"---CLAIMS TO EVALUATE---\n{claims_formatted}\n\n"
         f"---RETRIEVED EVIDENCE (ONLY CITE THESE SOURCES)---\n{evidence_formatted}\n\n"
         f"Search Status: {evidence.search_status}\n"
-        f"Search Notes: {evidence.search_notes}"
+        f"Search Notes: {evidence.search_notes}\n\n"
+        f"Output requirement: Return valid JSON containing 'claim_verdicts', 'overall_verdict', and 'summary'."
     )
 
     try:
@@ -939,11 +1209,16 @@ def run_verdict_stage(
             log.warning("Gemini verdict evaluation encountered transient error: %s", exc)
             raise AppError(user_msg, status=status_code, code=err_code) from exc
         log.exception("Gemini verdict evaluation call failed: %s", exc)
-        raise RuntimeError(f"Gemini evidence evaluation failed: {exc}") from exc
+    if evaluation is None:
+        raise AppError(
+            "Gemini returned no structured verdict evaluation. Cannot proceed with verification.",
+            status=422,
+            code="malformed_model_output",
+        )
 
     # Citation safety filter: only URLs actually supplied to the model are allowed
     cleaned_claim_verdicts: list[ClaimVerdictItem] = []
-    for cv in evaluation.claim_verdicts:
+    for cv in (evaluation.claim_verdicts or []):
         valid_citations = [u for u in cv.cited_sources if u in supplied_urls]
         cleaned_claim_verdicts.append(
             ClaimVerdictItem(
@@ -956,9 +1231,24 @@ def run_verdict_stage(
             )
         )
 
+    # Ensure all claims from stage 2 are accounted for
+    evaluated_claim_ids = {cv.claim_id for cv in cleaned_claim_verdicts}
+    for c in claims.claims:
+        if c.claim_id not in evaluated_claim_ids:
+            cleaned_claim_verdicts.append(
+                ClaimVerdictItem(
+                    claim_id=c.claim_id,
+                    claim_text=c.claim_text,
+                    verdict=ClaimVerdictLabel.INSUFFICIENT_EVIDENCE,
+                    explanation="External evidence was insufficient to corroborate or contradict this claim.",
+                    cited_sources=[],
+                    is_fee_warning_claim=c.is_fee_warning_claim,
+                )
+            )
+
     # Fee neutral caution safeguard
     scam_warnings = list(evaluation.scam_warnings or [])
-    has_scam_warning = evaluation.has_scam_warning or extracted.has_fee
+    has_scam_warning = bool(evaluation.has_scam_warning or extracted.has_fee)
     if extracted.has_fee:
         neutral_caution = (
             f"Registration fee detected{f' ({extracted.fee_raw})' if extracted.fee_raw else ''}. "

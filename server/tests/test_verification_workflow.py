@@ -1,13 +1,19 @@
+import json
 import os
 import unittest
 from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+from google.api_core.exceptions import ResourceExhausted
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+
 from app.config import get_settings
 from app.db import verification_repo
 from app.deps import AuthUser, current_user
 from app.errors import AppError
+from app.llm import MonitoredChatGoogleGenerativeAI
 from app.main import app
 from app.schemas.verification import (
     ClaimItem,
@@ -513,6 +519,525 @@ class TestGeminiPoweredVerificationWorkflow(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             run_card_stage(dummy_run["id"], stages_records=[], user_id=self.user_id)
         self.assertIn("prerequisite stages", str(ctx.exception))
+
+
+class TestMissingMetadataSafeHandling(unittest.TestCase):
+    """Regression tests for 'NoneType has no attribute author/organizer' errors.
+
+    Root cause: _invoke_structured_llm silently returned None when the LLM model
+    wrapper returned None instead of raising. The None propagated to `analysis`
+    in run_extracted_stage, and then analysis.author / analysis.organizer
+    raised AttributeError: 'NoneType' object has no attribute 'author'.
+
+    These tests cover:
+    - LLM returning None → AppError(malformed_model_output) not AttributeError
+    - Missing author in META → uses None gracefully, does not crash
+    - Absent organizer from LLM → defaults to 'Unverified organizer' safely
+    - 'url: none' in META section → author absent, no crash
+    - Empty-string author → treated as absent
+    - match_evidence_to_claims with empty title/organizer → safe execution
+    """
+
+    def setUp(self):
+        self.user_id = "regression-test-user-999"
+
+    def _make_rvpack_no_author(self, transcript="Valid opportunity."):
+        """An .rvpack with no author field in META (e.g. 'url: none' only)."""
+        return RVPackData(
+            transcript=transcript,
+            on_screen="Registration open",
+            meta={"url": "none"},   # author key deliberately absent
+            raw_text=transcript,
+            sections_found=["TRANSCRIPT", "ON_SCREEN", "META"],
+        )
+
+    def test_r1_llm_returning_none_raises_app_error_not_attribute_error(self):
+        """LLM invoke returning None must raise AppError(malformed_model_output), not AttributeError.
+
+        Previously this was the exact crash site:
+          analysis = _invoke_structured_llm(...)  # silently returned None
+          author = meta_author or analysis.author  # AttributeError: 'NoneType' object has no attribute 'author'
+        """
+        mock_llm = MagicMock()
+        mock_llm.with_structured_output.return_value = mock_llm
+        mock_llm.invoke.return_value = None   # ← The root cause: LLM returns None
+
+        rvpack = self._make_rvpack_no_author("Some opportunity announced.")
+
+        with self.assertRaises(AppError) as ctx:
+            run_extracted_stage(rvpack, llm_client=mock_llm)
+
+        self.assertEqual(ctx.exception.code, "malformed_model_output")
+        self.assertEqual(ctx.exception.status, 422)
+        # Must NOT raise AttributeError or any message about 'NoneType'
+        self.assertNotIn("NoneType", str(ctx.exception))
+        self.assertNotIn("has no attribute", str(ctx.exception))
+
+    def test_r2_llm_returning_none_via_plain_client_raises_app_error(self):
+        """Same guard: plain client without with_structured_output, returning None."""
+        mock_llm = MagicMock(spec=["invoke"])  # has invoke, but no with_structured_output
+        mock_llm.invoke.return_value = None
+
+        rvpack = self._make_rvpack_no_author()
+
+        with self.assertRaises(AppError) as ctx:
+            run_extracted_stage(rvpack, llm_client=mock_llm)
+
+        self.assertEqual(ctx.exception.code, "malformed_model_output")
+
+    def test_r3_missing_author_in_meta_section_does_not_crash(self):
+        """When META has 'url: none' but no 'author' key, run_extracted_stage must succeed.
+
+        Previously: meta_author was None, and if analysis.author was also None,
+        `author` would be None — which is fine. But if _invoke_structured_llm
+        returned None, the FIRST attribute access `analysis.author` crashed.
+
+        After fix: even when author is completely absent from META and LLM response,
+        extraction must succeed and produce author=None or author=''.
+        """
+        mock_analysis = GeminiClaimAnalysis(
+            title="Student Scholarship 2026",
+            organizer="Unverified organizer",
+            author=None,   # LLM provides no author
+            category="scholarship",
+            deadline_raw="30th November 2026",
+            deadline_date=None,
+            year_ambiguous=True,
+            has_fee=False,
+            is_fee_warning=False,
+            claims=[
+                ClaimItem(claim_id="c1", claim_text="Scholarship announced for students.", claim_type="event"),
+            ],
+            search_queries=["Student Scholarship 2026 official"],
+        )
+        mock_llm = MockLLM(response=mock_analysis)
+        rvpack = self._make_rvpack_no_author("Student scholarship for 2026 students.")
+
+        extracted = run_extracted_stage(rvpack, llm_client=mock_llm)
+
+        # Must not crash; author should be None (no source provided one)
+        self.assertIsNone(extracted.author)
+        self.assertEqual(extracted.title, "Student Scholarship 2026")
+        self.assertEqual(extracted.organizer, "Unverified organizer")
+
+    def test_r4_absent_organizer_from_llm_defaults_to_unverified(self):
+        """When the LLM returns empty/whitespace organizer, fallback to 'Unverified organizer'.
+
+        Previously this worked, but the guard now also handles non-str organizer values
+        that a buggy LLM response might inject.
+        """
+        mock_analysis = GeminiClaimAnalysis(
+            title="Mystery Hackathon 2026",
+            organizer="",        # LLM provides empty organizer
+            author=None,
+            category="hackathon",
+            claims=[],
+            search_queries=[],
+        )
+        mock_llm = MockLLM(response=mock_analysis)
+        rvpack = RVPackData(
+            transcript="A hackathon is happening next month! Don't miss out.",
+            on_screen="Register now",
+            meta={},
+            raw_text="A hackathon is happening next month!",
+            sections_found=["TRANSCRIPT", "ON_SCREEN"],
+        )
+
+        extracted = run_extracted_stage(rvpack, llm_client=mock_llm)
+
+        self.assertEqual(extracted.organizer, "Unverified organizer")
+        self.assertEqual(extracted.title, "Mystery Hackathon 2026")
+        self.assertIsNone(extracted.author)
+
+    def test_r5_url_none_in_meta_with_no_author_produces_valid_extraction(self):
+        """The exact failing sample: META contains 'url: none' with no author field.
+
+        Verifies the full extraction pipeline succeeds and the result is coherent.
+        """
+        mock_analysis = GeminiClaimAnalysis(
+            title="National Coding Challenge 2026",
+            organizer="Tech Foundation",
+            author=None,
+            category="competition",
+            deadline_raw="15th January 2027",
+            deadline_date=None,
+            year_ambiguous=True,
+            ambiguity_reason="Year not stated in original text.",
+            has_fee=False,
+            is_fee_warning=False,
+            claims=[
+                ClaimItem(claim_id="c1", claim_text="Organized by Tech Foundation.", claim_type="organizer"),
+                ClaimItem(claim_id="c2", claim_text="Deadline is 15th January 2027.", claim_type="deadline"),
+            ],
+            search_queries=["Tech Foundation National Coding Challenge 2026 official"],
+        )
+        mock_llm = MockLLM(response=mock_analysis)
+
+        rvpack_content = (
+            "---TRANSCRIPT---\n"
+            "Join the National Coding Challenge 2026 by Tech Foundation.\n"
+            "---ON_SCREEN---\n"
+            "Register before 15th January 2027.\n"
+            "---META---\n"
+            "url: none\n"
+        )
+        from app.services.rvpack_parser import parse_rvpack
+        rvpack = parse_rvpack(rvpack_content)
+
+        # Confirm parser behaviour: author absent, url = "none" as string
+        self.assertNotIn("author", rvpack.meta)
+        self.assertEqual(rvpack.meta.get("url"), "none")
+
+        extracted = run_extracted_stage(rvpack, llm_client=mock_llm)
+
+        self.assertEqual(extracted.title, "National Coding Challenge 2026")
+        self.assertEqual(extracted.organizer, "Tech Foundation")
+        self.assertIsNone(extracted.author)         # No author from META or LLM
+        self.assertFalse(extracted.has_fee)
+        self.assertEqual(len(extracted.claims), 2)
+
+    def test_r6_match_evidence_to_claims_safe_with_empty_title_and_organizer(self):
+        """match_evidence_to_claims and is_substantively_relevant must not crash
+        when ExtractedStagePayload has empty title or empty organizer strings.
+
+        Previously: extracted.title.lower() and extracted.organizer.lower() were
+        called unconditionally; if either was None (from a buggy upstream stage),
+        this would crash in the evidence phase too.
+        """
+        extracted_empty = ExtractedStagePayload(
+            title="",
+            organizer="",
+            links=[],
+        )
+        claims = [
+            ClaimItem(claim_id="c1", claim_text="Some claim about the event.", claim_type="event"),
+        ]
+
+        # Must not raise; returns empty list since no title tokens to match
+        result = match_evidence_to_claims(
+            ev_title="Official Portal",
+            ev_snippet="Registration details for the event.",
+            ev_url="https://example.org/event",
+            source_type="third_party",
+            claims=claims,
+            extracted=extracted_empty,
+        )
+        self.assertIsInstance(result, list)
+
+        # is_substantively_relevant must also be safe
+        from app.services.verification_workflow import is_substantively_relevant
+        is_rel, reason = is_substantively_relevant(
+            ev_title="Official Portal",
+            ev_snippet="Registration details.",
+            ev_url="https://example.org/event",
+            source_type="third_party",
+            extracted=extracted_empty,
+        )
+        # Empty title → no token match → not relevant (or possibly relevant via other paths, either is OK)
+        self.assertIsInstance(is_rel, bool)
+        self.assertIsInstance(reason, str)
+
+    def test_r7_step4_exact_rvpack_full_pipeline(self):
+        """Step 4 requirement: Test with the exact .rvpack from the problem prompt:
+        TRANSCRIPT:
+        ₹80,000 for every 12th pass student. Apply before 31 Oct. Pay ₹500 to register. Link in bio.
+
+        ON_SCREEN:
+        ₹80,000 FOR EVERY 12TH PASS STUDENT
+        Apply before Oct 31
+        Pay ₹500 registration fee
+        Limited seats available
+
+        META:
+        creator: opportunity.daily
+        posted: 2026-10-05
+        url: none
+        """
+        exact_rvpack_text = (
+            "TRANSCRIPT:\n"
+            "₹80,000 for every 12th pass student. Apply before 31 Oct. Pay ₹500 to register. Link in bio.\n\n"
+            "ON_SCREEN:\n"
+            "₹80,000 FOR EVERY 12TH PASS STUDENT\n"
+            "Apply before Oct 31\n"
+            "Pay ₹500 registration fee\n"
+            "Limited seats available\n\n"
+            "META:\n"
+            "creator: opportunity.daily\n"
+            "posted: 2026-10-05\n"
+            "url: none"
+        )
+        parsed = parse_rvpack(exact_rvpack_text)
+        self.assertEqual(parsed.meta.get("creator"), "opportunity.daily")
+        self.assertEqual(parsed.meta.get("posted"), "2026-10-05")
+        self.assertEqual(parsed.meta.get("url"), "none")
+
+        mock_claim_analysis = GeminiClaimAnalysis(
+            title="₹80,000 Student Scholarship for 12th Pass",
+            organizer="",  # Model provides empty string; workflow defaults to Unverified organizer
+            author="opportunity.daily",
+            category="scholarship",
+            deadline_raw="31 Oct",
+            deadline_date=None,  # Model leaves date ambiguous; workflow resolves it via posted date
+            year_ambiguous=True,
+            has_fee=True,
+            is_fee_warning=True,
+            fee_raw="₹500",
+            fee_warning_message="Registration fee detected (₹500). Verify organizer before paying.",
+            links=[],
+            claims=[
+                ClaimItem(claim_id="c1", claim_text="Scholarship of ₹80,000 offered for 12th pass students.", claim_type="reward"),
+                ClaimItem(claim_id="c2", claim_text="Application deadline is stated as 31 Oct.", claim_type="deadline"),
+                ClaimItem(claim_id="c3", claim_text="Registration fee of ₹500 is required.", claim_type="fee", is_fee_warning_claim=True),
+                ClaimItem(claim_id="c4", claim_text="The opportunity organizer is unverified in the announcement.", claim_type="organizer"),
+            ],
+            search_queries=["80000 12th pass student scholarship 2026", "scholarship ₹500 registration fee"],
+        )
+
+        mock_verdict_eval = GeminiVerdictEvaluation(
+            claim_verdicts=[
+                ClaimVerdictItem(
+                    claim_id="c1",
+                    claim_text="Scholarship of ₹80,000 offered for 12th pass students.",
+                    verdict=ClaimVerdictLabel.INSUFFICIENT_EVIDENCE,
+                    explanation="No independent official source corroborates this scholarship payout.",
+                    cited_sources=[],
+                ),
+                ClaimVerdictItem(
+                    claim_id="c2",
+                    claim_text="Application deadline is stated as 31 Oct.",
+                    verdict=ClaimVerdictLabel.INSUFFICIENT_EVIDENCE,
+                    explanation="No official education portal confirms this deadline.",
+                    cited_sources=[],
+                ),
+                ClaimVerdictItem(
+                    claim_id="c3",
+                    claim_text="Registration fee of ₹500 is required.",
+                    verdict=ClaimVerdictLabel.PARTIALLY_SUPPORTED,
+                    explanation="Fee requirement is noted in reel announcements but unverified by an official portal.",
+                    cited_sources=[],
+                    is_fee_warning_claim=True,
+                ),
+                ClaimVerdictItem(
+                    claim_id="c4",
+                    claim_text="The opportunity organizer is unverified in the announcement.",
+                    verdict=ClaimVerdictLabel.SUPPORTED,
+                    explanation="No recognized organizer was identified.",
+                    cited_sources=[],
+                ),
+            ],
+            overall_verdict=ClaimVerdictLabel.INSUFFICIENT_EVIDENCE,
+            summary="The announcement promotes an ₹80,000 scholarship with a ₹500 registration fee. No official organizer or primary source corroborates the scheme.",
+            scam_warnings=[
+                "Registration fee detected (₹500). Verify the organizer's identity, official event page, payment recipient, and refund policy before paying. A fee alone does not establish fraud.",
+            ],
+            has_scam_warning=True,
+            fraudulent_detected=False,  # Neutral caution: ₹500 alone does not prove fraud
+        )
+
+        mock_llm = MockLLM(responses=[mock_claim_analysis, mock_verdict_eval])
+        mock_tavily = MagicMock()
+        mock_tavily.search.return_value = {"results": []}
+
+        run = verification_repo.create_run(
+            user_id="user-step4-test",
+            raw_input=exact_rvpack_text,
+            input_type="rvpack",
+        )
+        run_id = run["id"]
+
+        result = execute_run(
+            run_id=run_id,
+            user_id="user-step4-test",
+            tavily_client=mock_tavily,
+            llm_client=mock_llm,
+        )
+
+        # 1. Pipeline status and stage ordering
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(
+            result["completed_stages"],
+            ["extracted", "claims", "evidence", "verdict", "card"],
+        )
+
+        # 2. Extracted stage checks
+        extracted_stage = verification_repo.get_stage(run_id, "extracted")
+        ext_payload = extracted_stage["payload"]
+        self.assertEqual(ext_payload["author"], "opportunity.daily")
+        self.assertEqual(ext_payload["organizer"], "Unverified organizer")
+        # Deadline resolved to October 31, 2026 via content + posted date
+        self.assertEqual(ext_payload["deadline"]["date"], "2026-10-31")
+        self.assertFalse(ext_payload["deadline"]["year_ambiguous"])
+        self.assertTrue(ext_payload["deadline"]["reminder_eligible"])
+        self.assertEqual(ext_payload["deadline"]["vault_reminder_status"], "ready_to_connect")
+        # Fee detected
+        self.assertTrue(ext_payload["has_fee"])
+        self.assertTrue(ext_payload["is_fee_warning"])
+        self.assertIn("500", ext_payload["fee_raw"])
+        # 'url: none' is discarded, not added as a URL
+        self.assertNotIn("none", ext_payload["links"])
+        self.assertNotIn("https://none", ext_payload["links"])
+
+        # 3. Claims stage checks
+        claims_stage = verification_repo.get_stage(run_id, "claims")
+        self.assertTrue(claims_stage["payload"]["contains_fee_claim"])
+        self.assertGreaterEqual(len(claims_stage["payload"]["claims"]), 3)
+
+        # 4. Evidence stage checks
+        evidence_stage = verification_repo.get_stage(run_id, "evidence")
+        self.assertIn(evidence_stage["payload"]["search_status"], ["completed", "no_results"])
+
+        # 5. Verdict stage checks
+        verdict_stage = verification_repo.get_stage(run_id, "verdict")
+        v_payload = verdict_stage["payload"]
+        self.assertEqual(v_payload["overall_verdict"], "insufficient evidence")
+        # Fee caution present
+        self.assertTrue(v_payload["has_scam_warning"])
+        self.assertFalse(v_payload["fraudulent_detected"])  # ₹500 fee alone does NOT declare fraud
+        # Every claim has one of the four allowed verdicts
+        allowed_verdicts = {"supported", "partially supported", "contradicted", "insufficient evidence"}
+        for cv in v_payload["claim_verdicts"]:
+            self.assertIn(cv["verdict"], allowed_verdicts)
+
+        # 6. Opportunity card checks
+        card = result["card"]
+        self.assertIsNotNone(card)
+        self.assertEqual(card["author"], "opportunity.daily")
+        self.assertEqual(card["organizer"], "Unverified organizer")
+        self.assertTrue(card["can_save_reminder"])
+        self.assertIsNotNone(card["vault_reminder_action"])
+        self.assertEqual(card["vault_reminder_action"]["event_date"], "2026-10-31")
+        self.assertEqual(card["deadline"]["vault_reminder_status"], "ready_to_connect")
+
+    def test_r8_evidence_search_failure_preserves_error_or_insufficient_evidence(self):
+        """When Tavily search raises an exception or times out, evidence stage records
+        search_status='failed', does NOT fabricate evidence, and verdict completes safely."""
+        mock_claim_analysis = GeminiClaimAnalysis(
+            title="Global AI Challenge 2026",
+            organizer="AI Society",
+            category="competition",
+            deadline_raw="15th December 2026",
+            deadline_date="2026-12-15",
+            year_ambiguous=False,
+            has_fee=False,
+            is_fee_warning=False,
+            claims=[
+                ClaimItem(claim_id="c1", claim_text="Organized by AI Society.", claim_type="organizer"),
+            ],
+            search_queries=["AI Society Global AI Challenge 2026 official"],
+        )
+        mock_verdict_eval = GeminiVerdictEvaluation(
+            claim_verdicts=[
+                ClaimVerdictItem(
+                    claim_id="c1",
+                    claim_text="Organized by AI Society.",
+                    verdict=ClaimVerdictLabel.INSUFFICIENT_EVIDENCE,
+                    explanation="Search failed; evidence unavailable.",
+                    cited_sources=[],
+                ),
+            ],
+            overall_verdict=ClaimVerdictLabel.INSUFFICIENT_EVIDENCE,
+            summary="External search failed; could not verify claims.",
+            fraudulent_detected=False,
+        )
+        mock_llm = MockLLM(responses=[mock_claim_analysis, mock_verdict_eval])
+
+        mock_tavily = MagicMock()
+        mock_tavily.search.side_effect = RuntimeError("Tavily rate limit / timeout / 500 error")
+
+        run = verification_repo.create_run(
+            user_id="user-tavily-fail-test",
+            raw_input="TRANSCRIPT:\nGlobal AI Challenge 2026.\nON_SCREEN:\nRegister online.\nMETA:\nurl: none",
+            input_type="rvpack",
+        )
+        result = execute_run(run["id"], "user-tavily-fail-test", tavily_client=mock_tavily, llm_client=mock_llm)
+
+        self.assertEqual(result["status"], "completed")
+        evidence_stage = verification_repo.get_stage(run["id"], "evidence")
+        self.assertEqual(evidence_stage["payload"]["search_status"], "failed")
+        self.assertIn("failed", evidence_stage["payload"]["search_notes"].lower())
+        self.assertEqual(len(evidence_stage["payload"]["evidence_items"]), 0)  # No fabricated evidence!
+
+    def test_r9_five_stage_ordering_and_resumption(self):
+        """Five-stage pipeline must strictly preserve ordering, block card creation until
+        all 4 stages are persisted, and resume cleanly without duplicating stages."""
+        run = verification_repo.create_run(
+            user_id="user-order-resume-test",
+            raw_input="TRANSCRIPT:\nHackathon 2026.\nON_SCREEN:\nRegister.\nMETA:\nurl: none",
+            input_type="rvpack",
+        )
+        run_id = run["id"]
+
+        # 1. Attempt to run card stage before prerequisites are met -> must raise ValueError
+        with self.assertRaises(ValueError) as ctx:
+            run_card_stage(run_id=run_id, user_id="user-order-resume-test")
+        self.assertIn("prerequisite stages", str(ctx.exception))
+
+        # 2. Simulate manual persistence of stage 1 and stage 2 only
+        mock_claim_analysis = GeminiClaimAnalysis(
+            title="Hackathon 2026",
+            organizer="Unverified organizer",
+            category="hackathon",
+            claims=[ClaimItem(claim_id="c1", claim_text="Hackathon announced.", claim_type="event")],
+            search_queries=["Hackathon 2026 official"],
+        )
+        mock_llm_call1 = MockLLM(response=mock_claim_analysis)
+
+        parsed = parse_rvpack("TRANSCRIPT:\nHackathon 2026.\nON_SCREEN:\nRegister.\nMETA:\nurl: none")
+        ext = run_extracted_stage(parsed, llm_client=mock_llm_call1)
+        verification_repo.save_stage(run_id, "extracted", 1, ext.model_dump(mode="json"))
+        claims = run_claims_stage(ext, parsed)
+        verification_repo.save_stage(run_id, "claims", 2, claims.model_dump(mode="json"))
+
+        # Both stages 1 and 2 are persisted
+        persisted = verification_repo.list_stages(run_id)
+        self.assertEqual([s["stage_name"] for s in persisted], ["extracted", "claims"])
+
+        # Card stage still blocked
+        with self.assertRaises(ValueError):
+            run_card_stage(run_id=run_id, user_id="user-order-resume-test")
+
+        # 3. Now resume workflow with complete clients
+        mock_verdict_eval = GeminiVerdictEvaluation(
+            claim_verdicts=[
+                ClaimVerdictItem(
+                    claim_id="c1",
+                    claim_text="Hackathon announced.",
+                    verdict=ClaimVerdictLabel.INSUFFICIENT_EVIDENCE,
+                    explanation="No evidence.",
+                    cited_sources=[],
+                ),
+            ],
+            overall_verdict=ClaimVerdictLabel.INSUFFICIENT_EVIDENCE,
+            summary="Summary.",
+            fraudulent_detected=False,
+        )
+        # Note: Call 1 should be skipped because stage 1 already completed!
+        mock_llm_resume = MockLLM(responses=[mock_verdict_eval])
+        mock_tavily = MagicMock()
+        mock_tavily.search.return_value = {"results": []}
+
+        result = execute_run(run_id, "user-order-resume-test", tavily_client=mock_tavily, llm_client=mock_llm_resume)
+        self.assertEqual(result["status"], "completed")
+
+        # Must have exactly 5 stages, strictly ordered 1 to 5, without duplicate records
+        final_stages = verification_repo.list_stages(run_id)
+        self.assertEqual(len(final_stages), 5)
+        self.assertEqual(
+            [s["stage_name"] for s in final_stages],
+            ["extracted", "claims", "evidence", "verdict", "card"],
+        )
+        self.assertEqual([s["stage_order"] for s in final_stages], [1, 2, 3, 4, 5])
+
+    def test_r10_existing_url_based_verification_intact(self):
+        """Existing URL-based verification data structures and endpoints remain intact."""
+        from app.schemas.reels import TavilyVerifyIn
+        body = TavilyVerifyIn(
+            summary="National Coding Contest 2026",
+            transcript="Join the contest before end of month.",
+            title="National Coding Contest",
+        )
+        self.assertEqual(body.summary, "National Coding Contest 2026")
+        self.assertIn("contest", body.transcript)
 
 
 class TestVerificationAPIEndpoints(unittest.TestCase):
@@ -1143,6 +1668,408 @@ class TestGeminiModelConfigAndWatchdogTimeouts(unittest.TestCase):
             self.assertEqual(ctx.exception.status, 504)
             self.assertEqual(ctx.exception.code, "gemini_timeout")
             self.assertIn("504 DEADLINE_EXCEEDED", ctx.exception.message)
+
+
+class TestOfflineMockedStructuredOutputAndErrorHandling(unittest.TestCase):
+    """Offline unit tests for Gemini structured output parsing and error handling without live API calls."""
+
+    def setUp(self):
+        self.user_id = "test-structured-user-001"
+        self.sample_rvpack = RVPackData(
+            transcript="IIT Bombay AI Hackathon 2026 registration is ₹500.",
+            on_screen="IIT Bombay AI Hackathon",
+            meta={"author": "iitb_official"},
+            raw_text="IIT Bombay AI Hackathon 2026",
+            sections_found=["TRANSCRIPT", "ON_SCREEN", "META"],
+        )
+
+    def test_mocked_valid_structured_output_raw_json(self):
+        """Valid JSON raw string in AIMessage content parses cleanly into GeminiClaimAnalysis."""
+        valid_json = json.dumps({
+            "title": "National AI Hackathon 2026",
+            "organizer": "IIT Bombay",
+            "author": "iitb_official",
+            "category": "hackathon",
+            "has_fee": True,
+            "fee_raw": "₹500",
+            "claims": [
+                {"claim_id": "c1", "claim_text": "Organized by IIT Bombay", "claim_type": "organizer"}
+            ],
+            "search_queries": ["IIT Bombay National AI Hackathon 2026 official"],
+        })
+        mock_client = MagicMock()
+        mock_client.invoke.return_value = AIMessage(content=valid_json)
+        mock_client.with_structured_output.return_value = mock_client
+
+        extracted = run_extracted_stage(self.sample_rvpack, llm_client=mock_client)
+        self.assertEqual(extracted.title, "National AI Hackathon 2026")
+        self.assertEqual(extracted.organizer, "IIT Bombay")
+        self.assertTrue(extracted.has_fee)
+        self.assertEqual(len(extracted.claims), 1)
+
+    def test_mocked_valid_structured_output_markdown_fences(self):
+        """Markdown code fenced JSON is safely extracted and parsed."""
+        valid_json = json.dumps({
+            "title": "National AI Hackathon 2026",
+            "organizer": "IIT Bombay",
+            "author": "iitb_official",
+            "category": "hackathon",
+            "has_fee": False,
+        })
+        md_content = f"```json\n{valid_json}\n```"
+        mock_client = MagicMock()
+        mock_client.invoke.return_value = AIMessage(content=md_content)
+        mock_client.with_structured_output.return_value = mock_client
+
+        extracted = run_extracted_stage(self.sample_rvpack, llm_client=mock_client)
+        self.assertEqual(extracted.title, "National AI Hackathon 2026")
+        self.assertEqual(extracted.organizer, "IIT Bombay")
+
+    def test_mocked_valid_structured_output_tool_calls(self):
+        """AIMessage with tool_calls is parsed into GeminiClaimAnalysis."""
+        args_dict = {
+            "title": "National AI Hackathon 2026",
+            "organizer": "IIT Bombay",
+            "category": "hackathon",
+        }
+        msg = AIMessage(content="", tool_calls=[{"name": "GeminiClaimAnalysis", "args": args_dict, "id": "tc_1"}])
+        mock_client = MagicMock()
+        mock_client.invoke.return_value = msg
+        mock_client.with_structured_output.return_value = mock_client
+
+        extracted = run_extracted_stage(self.sample_rvpack, llm_client=mock_client)
+        self.assertEqual(extracted.title, "National AI Hackathon 2026")
+        self.assertEqual(extracted.organizer, "IIT Bombay")
+
+    def test_mocked_malformed_json_raises_422_app_error(self):
+        """Malformed JSON string produces AppError(422, malformed_model_output)."""
+        mock_client = MagicMock()
+        mock_client.invoke.return_value = AIMessage(content='{"title": "Broken", organizer: missing_quote')
+        mock_client.with_structured_output.return_value = mock_client
+
+        with self.assertRaises(AppError) as ctx:
+            run_extracted_stage(self.sample_rvpack, llm_client=mock_client)
+        self.assertEqual(ctx.exception.status, 422)
+        self.assertEqual(ctx.exception.code, "malformed_model_output")
+
+    def test_mocked_missing_required_fields_raises_422_app_error(self):
+        """JSON output missing required schema fields produces AppError(422, malformed_model_output)."""
+        mock_client = MagicMock()
+        mock_client.invoke.return_value = AIMessage(content=json.dumps({"title": "Incomplete"}))
+        mock_client.with_structured_output.return_value = mock_client
+
+        with self.assertRaises(AppError) as ctx:
+            run_extracted_stage(self.sample_rvpack, llm_client=mock_client)
+        self.assertEqual(ctx.exception.status, 422)
+        self.assertEqual(ctx.exception.code, "malformed_model_output")
+
+    def test_mocked_empty_response_raises_422_app_error(self):
+        """Empty string or whitespace model output produces AppError(422, malformed_model_output)."""
+        mock_client = MagicMock()
+        mock_client.invoke.return_value = AIMessage(content="   \n")
+        mock_client.with_structured_output.return_value = mock_client
+
+        with self.assertRaises(AppError) as ctx:
+            run_extracted_stage(self.sample_rvpack, llm_client=mock_client)
+        self.assertEqual(ctx.exception.status, 422)
+        self.assertEqual(ctx.exception.code, "malformed_model_output")
+
+    def test_mocked_quota_error_preserves_429_rate_limit(self):
+        """Google API ResourceExhausted (429) is preserved and not disguised as malformed output."""
+        mock_client = MagicMock()
+        mock_client.invoke.side_effect = ResourceExhausted("429 Resource has been exhausted (e.g. check quota).")
+        mock_client.with_structured_output.return_value = mock_client
+
+        with self.assertRaises(AppError) as ctx:
+            run_extracted_stage(self.sample_rvpack, llm_client=mock_client)
+        self.assertEqual(ctx.exception.status, 429)
+        self.assertEqual(ctx.exception.code, "gemini_rate_limited")
+        self.assertIn("rate limit reached", ctx.exception.message)
+
+    def test_mocked_verdict_valid_structured_output(self):
+        """GeminiVerdictEvaluation (Call 2) parses valid raw JSON output correctly."""
+        claims = ClaimsStagePayload(
+            claims=[ClaimItem(claim_id="c1", claim_text="Organized by IIT Bombay", claim_type="organizer")],
+            total_claims=1,
+        )
+        evidence = EvidenceStagePayload(
+            evidence_items=[
+                EvidenceItem(
+                    id="ev_1",
+                    claim_ids=["c1"],
+                    url="https://iitb.ac.in/event",
+                    title="IIT Bombay Event",
+                    domain="iitb.ac.in",
+                    source_type="official_organizer",
+                )
+            ],
+            queries_used=["IIT Bombay official"],
+            official_domains=["iitb.ac.in"],
+            search_status="completed",
+        )
+        extracted = ExtractedStagePayload(title="AI Hackathon 2026", organizer="IIT Bombay")
+
+        verdict_json = json.dumps({
+            "claim_verdicts": [
+                {
+                    "claim_id": "c1",
+                    "claim_text": "Organized by IIT Bombay",
+                    "verdict": "supported",
+                    "explanation": "Corroborated by official site.",
+                    "cited_sources": ["https://iitb.ac.in/event"],
+                }
+            ],
+            "overall_verdict": "supported",
+            "summary": "Verified event from official organizer.",
+            "scam_warnings": [],
+            "has_scam_warning": False,
+            "fraudulent_detected": False,
+        })
+
+        mock_client = MagicMock()
+        mock_client.invoke.return_value = AIMessage(content=verdict_json)
+        mock_client.with_structured_output.return_value = mock_client
+
+        verdict_stage = run_verdict_stage(claims, evidence, extracted, llm_client=mock_client)
+        self.assertEqual(verdict_stage.overall_verdict, ClaimVerdictLabel.SUPPORTED)
+        self.assertEqual(len(verdict_stage.claim_verdicts), 1)
+        self.assertEqual(verdict_stage.claim_verdicts[0].cited_sources, ["https://iitb.ac.in/event"])
+
+    def test_actual_malformed_verdict_missing_claim_verdicts_raises_422(self):
+        """Actual Gemini malformed response with only 'verdict' and 'explanation' (missing claim_verdicts) raises 422."""
+        claims = ClaimsStagePayload(
+            claims=[ClaimItem(claim_id="c1", claim_text="Organized by IIT Bombay", claim_type="organizer")],
+            total_claims=1,
+        )
+        evidence = EvidenceStagePayload(
+            evidence_items=[],
+            queries_used=[],
+            official_domains=[],
+            search_status="completed",
+        )
+        extracted = ExtractedStagePayload(title="AI Hackathon 2026", organizer="IIT Bombay")
+
+        # The exact shape Gemini returned in the reported failure:
+        malformed_json = json.dumps({
+            "verdict": "supported",
+            "explanation": "Event is officially organized and legitimate.",
+        })
+        mock_client = MagicMock()
+        mock_client.invoke.return_value = AIMessage(content=malformed_json)
+        mock_client.with_structured_output.return_value = mock_client
+
+        with self.assertRaises(AppError) as ctx:
+            run_verdict_stage(claims, evidence, extracted, llm_client=mock_client)
+
+        self.assertEqual(ctx.exception.status, 422)
+        self.assertEqual(ctx.exception.code, "malformed_model_output")
+        self.assertIn("claim_verdicts", ctx.exception.message)
+
+    def test_verdict_missing_overall_verdict_raises_422(self):
+        """JSON output with claim_verdicts and summary but missing overall_verdict raises 422."""
+        claims = ClaimsStagePayload(
+            claims=[ClaimItem(claim_id="c1", claim_text="Organized by IIT Bombay", claim_type="organizer")],
+            total_claims=1,
+        )
+        evidence = EvidenceStagePayload(search_status="completed")
+        extracted = ExtractedStagePayload(title="AI Hackathon 2026", organizer="IIT Bombay")
+
+        missing_overall_json = json.dumps({
+            "claim_verdicts": [
+                {
+                    "claim_id": "c1",
+                    "claim_text": "Organized by IIT Bombay",
+                    "verdict": "supported",
+                    "explanation": "Confirmed.",
+                }
+            ],
+            "summary": "Verified event.",
+        })
+        mock_client = MagicMock()
+        mock_client.invoke.return_value = AIMessage(content=missing_overall_json)
+        mock_client.with_structured_output.return_value = mock_client
+
+        with self.assertRaises(AppError) as ctx:
+            run_verdict_stage(claims, evidence, extracted, llm_client=mock_client)
+
+        self.assertEqual(ctx.exception.status, 422)
+        self.assertEqual(ctx.exception.code, "malformed_model_output")
+        self.assertIn("overall_verdict", ctx.exception.message)
+
+    def test_verdict_with_invalid_verdict_enum_value_raises_422(self):
+        """Disallowed verdict string (e.g. 'verified') raises 422 and does not permit arbitrary labels."""
+        claims = ClaimsStagePayload(
+            claims=[ClaimItem(claim_id="c1", claim_text="Organized by IIT Bombay", claim_type="organizer")],
+            total_claims=1,
+        )
+        evidence = EvidenceStagePayload(search_status="completed")
+        extracted = ExtractedStagePayload(title="AI Hackathon 2026", organizer="IIT Bombay")
+
+        invalid_label_json = json.dumps({
+            "claim_verdicts": [
+                {
+                    "claim_id": "c1",
+                    "claim_text": "Organized by IIT Bombay",
+                    "verdict": "supported",
+                    "explanation": "Confirmed.",
+                }
+            ],
+            "overall_verdict": "verified",  # Not in ClaimVerdictLabel
+            "summary": "Verified event.",
+        })
+        mock_client = MagicMock()
+        mock_client.invoke.return_value = AIMessage(content=invalid_label_json)
+        mock_client.with_structured_output.return_value = mock_client
+
+        with self.assertRaises(AppError) as ctx:
+            run_verdict_stage(claims, evidence, extracted, llm_client=mock_client)
+
+        self.assertEqual(ctx.exception.status, 422)
+        self.assertEqual(ctx.exception.code, "malformed_model_output")
+
+    def test_verdict_claim_with_invalid_enum_value_raises_422(self):
+        """Claim verdict with disallowed label (e.g. 'untrue') raises 422."""
+        claims = ClaimsStagePayload(
+            claims=[ClaimItem(claim_id="c1", claim_text="Organized by IIT Bombay", claim_type="organizer")],
+            total_claims=1,
+        )
+        evidence = EvidenceStagePayload(search_status="completed")
+        extracted = ExtractedStagePayload(title="AI Hackathon 2026", organizer="IIT Bombay")
+
+        invalid_claim_label_json = json.dumps({
+            "claim_verdicts": [
+                {
+                    "claim_id": "c1",
+                    "claim_text": "Organized by IIT Bombay",
+                    "verdict": "untrue",  # Not in ClaimVerdictLabel
+                    "explanation": "Fake.",
+                }
+            ],
+            "overall_verdict": "contradicted",
+            "summary": "Disproven.",
+        })
+        mock_client = MagicMock()
+        mock_client.invoke.return_value = AIMessage(content=invalid_claim_label_json)
+        mock_client.with_structured_output.return_value = mock_client
+
+        with self.assertRaises(AppError) as ctx:
+            run_verdict_stage(claims, evidence, extracted, llm_client=mock_client)
+
+        self.assertEqual(ctx.exception.status, 422)
+        self.assertEqual(ctx.exception.code, "malformed_model_output")
+
+    def test_verdict_with_aliased_fields_succeeds(self):
+        """Output using standard aliases ('claims', 'verdict', 'explanation') succeeds without fabrication."""
+        claims = ClaimsStagePayload(
+            claims=[ClaimItem(claim_id="c1", claim_text="Organized by IIT Bombay", claim_type="organizer")],
+            total_claims=1,
+        )
+        evidence = EvidenceStagePayload(
+            evidence_items=[
+                EvidenceItem(id="e1", url="https://iitb.ac.in", title="IITB", source_type="official_organizer")
+            ],
+            search_status="completed",
+        )
+        extracted = ExtractedStagePayload(title="AI Hackathon 2026", organizer="IIT Bombay")
+
+        aliased_json = json.dumps({
+            "claims": [
+                {
+                    "claim_id": "c1",
+                    "claim_text": "Organized by IIT Bombay",
+                    "verdict": "supported",
+                    "explanation": "Corroborated by official website.",
+                    "cited_sources": ["https://iitb.ac.in"],
+                }
+            ],
+            "verdict": "supported",
+            "explanation": "Organized by IIT Bombay according to primary sources.",
+        })
+        mock_client = MagicMock()
+        mock_client.invoke.return_value = AIMessage(content=aliased_json)
+        mock_client.with_structured_output.return_value = mock_client
+
+        verdict_stage = run_verdict_stage(claims, evidence, extracted, llm_client=mock_client)
+        self.assertEqual(verdict_stage.overall_verdict, ClaimVerdictLabel.SUPPORTED)
+        self.assertEqual(len(verdict_stage.claim_verdicts), 1)
+        self.assertEqual(verdict_stage.claim_verdicts[0].verdict, ClaimVerdictLabel.SUPPORTED)
+        self.assertEqual(verdict_stage.summary, "Organized by IIT Bombay according to primary sources.")
+
+    def test_verdict_normalizes_permitted_labels_with_underscores_and_casing(self):
+        """Permitted verdict labels with underscores or casing are normalized to canonical enum values."""
+        claims = ClaimsStagePayload(
+            claims=[ClaimItem(claim_id="c1", claim_text="Organized by IIT Bombay", claim_type="organizer")],
+            total_claims=1,
+        )
+        evidence = EvidenceStagePayload(search_status="completed")
+        extracted = ExtractedStagePayload(title="AI Hackathon 2026", organizer="IIT Bombay")
+
+        normalized_json = json.dumps({
+            "claim_verdicts": [
+                {
+                    "claim_id": "c1",
+                    "claim_text": "Organized by IIT Bombay",
+                    "verdict": "PARTIALLY_SUPPORTED",
+                    "explanation": "Partial match.",
+                }
+            ],
+            "overall_verdict": "partially_supported",
+            "summary": "Partially verified opportunity.",
+        })
+        mock_client = MagicMock()
+        mock_client.invoke.return_value = AIMessage(content=normalized_json)
+        mock_client.with_structured_output.return_value = mock_client
+
+        verdict_stage = run_verdict_stage(claims, evidence, extracted, llm_client=mock_client)
+        self.assertEqual(verdict_stage.overall_verdict, ClaimVerdictLabel.PARTIALLY_SUPPORTED)
+        self.assertEqual(verdict_stage.claim_verdicts[0].verdict, ClaimVerdictLabel.PARTIALLY_SUPPORTED)
+
+    def test_monitored_chat_model_structured_output_gemini_verdict_evaluation(self):
+        """MonitoredChatGoogleGenerativeAI with_structured_output produces validated GeminiVerdictEvaluation offline."""
+        model = MonitoredChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key="fake-key")
+        verdict_json = json.dumps({
+            "claim_verdicts": [
+                {
+                    "claim_id": "c1",
+                    "claim_text": "Organized by IIT Bombay",
+                    "verdict": "supported",
+                    "explanation": "Official source matches.",
+                    "cited_sources": ["https://iitb.ac.in"],
+                }
+            ],
+            "overall_verdict": "supported",
+            "summary": "Verified event from official organizer.",
+        })
+        mock_msg = AIMessage(content=verdict_json)
+        mock_gen = ChatGeneration(message=mock_msg)
+        mock_result = ChatResult(generations=[mock_gen])
+
+        with patch.object(model, "_generate", return_value=mock_result):
+            chain = model.with_structured_output(GeminiVerdictEvaluation)
+            parsed = chain.invoke("Evaluate verdict")
+            self.assertIsInstance(parsed, GeminiVerdictEvaluation)
+            self.assertEqual(parsed.overall_verdict, ClaimVerdictLabel.SUPPORTED)
+            self.assertEqual(len(parsed.claim_verdicts), 1)
+            self.assertEqual(parsed.claim_verdicts[0].verdict, ClaimVerdictLabel.SUPPORTED)
+
+    def test_monitored_chat_model_structured_output_returns_pydantic_instance(self):
+        """MonitoredChatGoogleGenerativeAI with_structured_output produces a validated Pydantic object offline."""
+        model = MonitoredChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key="fake-key")
+        valid_json = json.dumps({
+            "title": "National AI Hackathon 2026",
+            "organizer": "IIT Bombay",
+            "category": "hackathon",
+        })
+        mock_msg = AIMessage(content=valid_json)
+        mock_gen = ChatGeneration(message=mock_msg)
+        mock_result = ChatResult(generations=[mock_gen])
+
+        with patch.object(model, "_generate", return_value=mock_result):
+            chain = model.with_structured_output(GeminiClaimAnalysis)
+            parsed = chain.invoke("Extract claims")
+            self.assertIsInstance(parsed, GeminiClaimAnalysis)
+            self.assertEqual(parsed.title, "National AI Hackathon 2026")
+            self.assertEqual(parsed.organizer, "IIT Bombay")
 
 
 if __name__ == "__main__":

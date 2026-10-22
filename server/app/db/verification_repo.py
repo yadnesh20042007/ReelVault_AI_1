@@ -240,6 +240,8 @@ def create_run(user_id: str, raw_input: str, input_type: str = "rvpack", user_re
 
 
 def get_run(run_id: str, user_id: str | None = None) -> dict | None:
+    if run_id in _fallback_store._runs:
+        return _fallback_store.get_run(run_id, user_id)
     if _check_supabase_tables():
         try:
             db = get_active_db()
@@ -263,6 +265,8 @@ def get_run(run_id: str, user_id: str | None = None) -> dict | None:
 
 def update_run(run_id: str, **fields) -> dict | None:
     fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if run_id in _fallback_store._runs:
+        return _fallback_store.update_run(run_id, **fields)
     if _check_supabase_tables():
         try:
             db = get_active_db()
@@ -284,6 +288,9 @@ def save_stage(run_id: str, stage_name: str, stage_order: int, payload: dict, st
     existing = get_stage(run_id, stage_name)
     if existing:
         return existing
+
+    if run_id in _fallback_store._runs:
+        return _fallback_store.save_stage(run_id, stage_name, stage_order, payload, status)
 
     if _check_supabase_tables():
         try:
@@ -314,6 +321,9 @@ def save_stage(run_id: str, stage_name: str, stage_order: int, payload: dict, st
 
 
 def get_stage(run_id: str, stage_name: str) -> dict | None:
+    if run_id in _fallback_store._runs:
+        return _fallback_store.get_stage(run_id, stage_name)
+
     if _check_supabase_tables():
         try:
             db = get_active_db()
@@ -338,6 +348,9 @@ def get_stage(run_id: str, stage_name: str) -> dict | None:
 
 def list_stages(run_id: str) -> list[dict]:
     """Return all persisted stages for a run, strictly ordered by stage_order ASC."""
+    if run_id in _fallback_store._runs:
+        return _fallback_store.list_stages(run_id)
+
     if _check_supabase_tables():
         try:
             db = get_active_db()
@@ -348,7 +361,7 @@ def list_stages(run_id: str) -> list[dict]:
                 .order("stage_order", desc=False)
                 .execute()
             )
-            if res.data is not None:
+            if res.data:
                 return res.data
         except Exception as exc:
             log.warning("Supabase list verification_stages failed: %s", exc)

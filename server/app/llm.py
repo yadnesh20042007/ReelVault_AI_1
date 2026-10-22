@@ -1,12 +1,19 @@
+import json
 import logging
 import os
+import re
 import threading
 import time
-from typing import Literal
+from typing import Any, Literal, Optional
 
 from google.api_core.exceptions import ResourceExhausted, TooManyRequests
 from langchain.chat_models import init_chat_model
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, Generation
+from langchain_core.output_parsers import BaseOutputParser
+from langchain_core.runnables import Runnable
 from langchain_google_genai.chat_models import ChatGoogleGenerativeAI
+from pydantic import BaseModel
 
 from app.config import get_settings
 from app.errors import PipelineError
@@ -84,6 +91,70 @@ class KeyPool:
 _key_pool = KeyPool()
 
 
+class RobustModelOutputParser(BaseOutputParser):
+    schema_cls: Any
+
+    def parse_result(self, result: list[Generation], *, partial: bool = False) -> Any:
+        if not result:
+            return None
+        gen = result[0]
+        msg = getattr(gen, "message", None)
+
+        # 1. Tool calls
+        tool_calls = getattr(msg, "tool_calls", None) if msg else None
+        if tool_calls and isinstance(tool_calls, list) and len(tool_calls) > 0:
+            tc = tool_calls[0]
+            args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", None)
+            if isinstance(args, dict):
+                if isinstance(self.schema_cls, type) and issubclass(self.schema_cls, BaseModel):
+                    return self.schema_cls.model_validate(args)
+                return args
+            elif isinstance(args, str) and args.strip():
+                try:
+                    data = json.loads(args)
+                    if isinstance(self.schema_cls, type) and issubclass(self.schema_cls, BaseModel):
+                        return self.schema_cls.model_validate(data)
+                    return data
+                except Exception:
+                    pass
+
+        # 2. Content text
+        content = getattr(msg, "content", "") if msg else getattr(gen, "text", "")
+        if isinstance(content, list):
+            parts = []
+            for p in content:
+                if isinstance(p, str):
+                    parts.append(p)
+                elif isinstance(p, dict) and "text" in p:
+                    parts.append(p["text"])
+            content = "\n".join(parts)
+
+        if not isinstance(content, str) or not content.strip():
+            return None
+
+        cleaned = content.strip()
+        if "```" in cleaned:
+            m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
+            if m:
+                cleaned = m.group(1).strip()
+
+        try:
+            data = json.loads(cleaned)
+        except Exception:
+            m = re.search(r"(\{[\s\S]*\})", cleaned)
+            if m:
+                data = json.loads(m.group(1))
+            else:
+                raise
+
+        if isinstance(self.schema_cls, type) and issubclass(self.schema_cls, BaseModel):
+            return self.schema_cls.model_validate(data)
+        return data
+
+    def parse(self, text: str) -> Any:
+        return self.parse_result([ChatGeneration(message=AIMessage(content=text))])
+
+
 class MonitoredChatGoogleGenerativeAI(ChatGoogleGenerativeAI):
     """ChatGoogleGenerativeAI that intercepts quota / rate limit errors to mark the key in KeyPool."""
 
@@ -104,6 +175,38 @@ class MonitoredChatGoogleGenerativeAI(ChatGoogleGenerativeAI):
             if _is_key_or_quota_error(exc):
                 _key_pool.mark_exhausted(self.api_key_str)
             raise
+
+    def with_structured_output(
+        self,
+        schema: Any,
+        method: Optional[Literal["function_calling", "json_mode"]] = "json_mode",
+        *,
+        include_raw: bool = False,
+        **kwargs: Any,
+    ) -> Runnable:
+        if method == "function_calling":
+            return super().with_structured_output(schema, method="function_calling", include_raw=include_raw, **kwargs)
+
+        schema_json = None
+        if isinstance(schema, type) and issubclass(schema, BaseModel):
+            from langchain_google_genai._function_utils import replace_defs_in_schema
+            schema_json = replace_defs_in_schema(schema.model_json_schema())
+        elif isinstance(schema, dict):
+            schema_json = schema
+
+        bind_kwargs: dict[str, Any] = {"response_mime_type": "application/json"}
+        if schema_json:
+            bind_kwargs["response_schema"] = schema_json
+
+        parser = RobustModelOutputParser(schema_cls=schema)
+        bound = self.bind(**bind_kwargs)
+        if include_raw:
+            from operator import itemgetter
+            from langchain_core.runnables import RunnablePassthrough
+            return {"raw": bound} | RunnablePassthrough.assign(
+                parsed=itemgetter("raw") | parser
+            )
+        return bound | parser
 
 
 def _build_model(model_name: str, key: str, max_retries: int, timeout: float = 30.0):
