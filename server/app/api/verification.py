@@ -8,13 +8,18 @@ from app.deps import AuthUser, current_user
 from app.errors import AppError, NotFound, NoContent
 from app.schemas.verification import (
     RVPackInput,
+    SaveToVaultOut,
     StageRecordOut,
     VaultReminderConnectIn,
     VaultReminderConnectOut,
     VerificationRunOut,
 )
 from app.services.rvpack_parser import parse_rvpack
-from app.services.verification_workflow import connect_deadline_to_vault, execute_run
+from app.services.verification_workflow import (
+    connect_deadline_to_vault,
+    execute_run,
+    save_opportunity_card_to_vault,
+)
 
 log = logging.getLogger("api.verification")
 router = APIRouter(prefix="/verification", tags=["verification"])
@@ -237,3 +242,36 @@ def connect_vault_reminder(
         raise AppError(str(val_err), status=422, code="ambiguous_deadline_year")
     except Exception as exc:
         raise AppError(f"Could not connect Vault reminder: {exc}", status=500, code="vault_connect_failed")
+
+
+@router.post(
+    "/runs/{run_id}/save-to-vault",
+    response_model=SaveToVaultOut,
+    summary="Save Verified Opportunity Card to Vault",
+    description="Persist the complete Stage 5 opportunity card to Vault shelf without scheduling a calendar event."
+)
+def save_to_vault(
+    run_id: str,
+    user: AuthUser = Depends(current_user),
+):
+    """Save complete verified opportunity card to Vault shelf.
+    
+    Checks that the run belongs to the authenticated user and that its first four
+    stages are complete and its Card stage exists. Operates independently from calendar reminders.
+    """
+    run = verification_repo.get_run(run_id)
+    if not run:
+        raise NotFound("Verification run not found.")
+    if str(run.get("user_id")) != str(user.id):
+        raise AppError("You do not have permission to save this verification run.", status=403, code="forbidden")
+
+    try:
+        res = save_opportunity_card_to_vault(run_id=run_id, user_id=user.id)
+        return SaveToVaultOut(**res)
+    except PermissionError as perm_err:
+        raise AppError(str(perm_err), status=403, code="forbidden")
+    except ValueError as val_err:
+        raise AppError(str(val_err), status=400, code="incomplete_stages")
+    except Exception as exc:
+        raise AppError(f"Could not save opportunity to Vault: {exc}", status=500, code="vault_save_failed")
+

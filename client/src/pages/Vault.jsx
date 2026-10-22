@@ -38,9 +38,22 @@ import {
 import { api, ApiError } from "../services/api";
 import { useAuth } from "../auth/useAuth";
 import { useProfile } from "../auth/useProfile";
-import SavedCalendar, { dateKey } from "../components/calendar/SavedCalendar";
 import { useLanguage } from "../preferences/LanguageContext";
-import { resolveCompanyLink, isGenericGoogleUrl, KNOWN_COMPANIES } from "../utils/companyLinks";
+import SavedCalendar, { dateKey } from "../components/calendar/SavedCalendar";
+import {
+  resolveCompanyLink,
+  isGenericGoogleUrl,
+  isGenericRootUrl,
+  verifyRegistrationLink,
+  findOfficialRegistrationLink,
+  KNOWN_COMPANIES,
+} from "../utils/companyLinks";
+import {
+  resolveUsableIsoDate,
+  formatDisplayDate,
+  isPlaceholderDate,
+  isValidCalendarDate,
+} from "../utils/dateUtils";
 
 const ACTIVE_STATUSES = new Set([
   "queued",
@@ -58,15 +71,9 @@ const REPORT_SECTIONS = [
   ["red_flags", "Red flags"],
 ];
 
-function formatDate(value) {
-  const date = new Date(value);
-  return Number.isNaN(date.getTime())
-    ? "Date unavailable"
-    : new Intl.DateTimeFormat(undefined, {
-        day: "numeric",
-        month: "short",
-        year: "numeric",
-      }).format(date);
+function formatDate(value, anchorDate = null) {
+  const iso = resolveUsableIsoDate(value, anchorDate);
+  return iso ? formatDisplayDate(iso) : "Date unavailable";
 }
 
 function transcriptChunks(text) {
@@ -106,10 +113,8 @@ function sourceHref(url) {
   return /^https?:\/\//i.test(url) ? url : `https://${url}`;
 }
 
-function toInputDate(value) {
-  if (!value) return "";
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? "" : parsed.toISOString().slice(0, 10);
+function toInputDate(value, anchorDate = null) {
+  return resolveUsableIsoDate(value, anchorDate) || "";
 }
 
 function openGoogleCalendar(reel, label, dateString) {
@@ -237,7 +242,7 @@ function renderHighlightedSummary(summary, extraKeywords = []) {
   );
 }
 
-function getExtractedData(reel) {
+function getExtractedData(reel, tavilyResult = null) {
   const analysis = reel.analysis || {};
   const fullText = [
     reel.title || "",
@@ -275,8 +280,11 @@ function getExtractedData(reel) {
     if (s.url) addDetectedLink(s.url, s.name);
   });
 
+  // Only detect EXPLICITLY stated URLs (https:// or www. prefix, or explicit form/code portals with path).
+  // Do NOT include bare company domains (amazon.com, nvidia.com etc.) --
+  // those are company name references, not stated links, and must not pollute registration-link checking.
   const URL_DETECTION_REGEX =
-    /https?:\/\/[^\s)\]>"',]+|(?:www\.)[-a-zA-Z0-9@:%._+~#=]{2,256}\.[a-z]{2,6}(?:\/[-\w@:%_+.~#?&/=]*)?|\b(?:github\.com|summerofcode\.withgoogle\.com|aifoundersgrant\.org|forms\.gle|quizlet\.com|odoo\.com|amazon\.com|nvidia\.com|google\.com)[^\s)\]>"',]*/gi;
+    /https?:\/\/[^\s)\]>"',]+|(?:www\.)[-a-zA-Z0-9@:%._+~#=]{2,256}\.[a-z]{2,6}(?:\/[-\w@:%_+.~#?&/=]*)?|\b(?:github\.com\/[^\s)\]>"',]+|summerofcode\.withgoogle\.com|aifoundersgrant\.org|forms\.gle\/[^\s)\]>"',]+)/gi;
   let urlMatch;
   while ((urlMatch = URL_DETECTION_REGEX.exec(fullText)) !== null) {
     addDetectedLink(urlMatch[0], "Transcript Mention");
@@ -300,9 +308,11 @@ function getExtractedData(reel) {
     }
   };
 
-  (analysis.resources || []).forEach((r) => addResource(r.label, r.url));
+  (analysis.resources || []).forEach((r) => {
+    if (!isGenericRootUrl(r.url)) addResource(r.label, r.url);
+  });
   (analysis.sources || []).forEach((s) => {
-    if (s.url) {
+    if (s.url && !isGenericRootUrl(s.url)) {
       let lbl = s.name || "Official Website";
       if (/apply|portal/i.test(s.name || s.url)) lbl = "Application";
       else if (/register|reg/i.test(s.name || s.url)) lbl = "Registration";
@@ -312,6 +322,7 @@ function getExtractedData(reel) {
   });
 
   allDetectedLinks.forEach(({ url, hostname }) => {
+    if (isGenericRootUrl(url)) return;
     const low = url.toLowerCase();
     let lbl = null;
     if (low.includes("register") || low.includes("registration")) lbl = "Registration";
@@ -319,38 +330,58 @@ function getExtractedData(reel) {
     else if (low.includes("github.com")) lbl = "GitHub Repository";
     else if (low.includes("forms.gle") || low.includes("form")) lbl = "Form";
     else if (low.includes("docs.") || low.includes("documentation")) lbl = "Documentation";
-    else if (resourcesList.length === 0) lbl = `Official Website (${hostname})`;
     if (lbl) addResource(lbl, url);
   });
 
   if (resourcesList.length === 0 && allDetectedLinks.length > 0) {
-    addResource(`Official Link (${allDetectedLinks[0].hostname})`, allDetectedLinks[0].url);
+    const nonRoot = allDetectedLinks.find((l) => !isGenericRootUrl(l.url));
+    if (nonRoot) {
+      addResource(`Official Link (${nonRoot.hostname})`, nonRoot.url);
+    }
   }
 
-  // 3. Actionable Dates (Zero hallucination: only real dates)
-  const regUrl =
-    resourcesList.find((r) => /register|apply|form/i.test(r.label || r.url))?.url ||
-    allDetectedLinks[0]?.url ||
-    null;
+  // 3. Actionable Dates - Clearly distinguish extracted reel dates from externally discovered verified deadlines
+  const verifiedRegResource = resourcesList.find((r) =>
+    /register|apply|portal|form/i.test(r.label || r.url) && !isGenericRootUrl(r.url)
+  );
+  const regUrl = verifiedRegResource
+    ? verifiedRegResource.url
+    : allDetectedLinks.find((l) => !isGenericRootUrl(l.url) && /register|apply|form/i.test(l.url))?.url ||
+      null;
 
-  const datesList = [];
+  const reelDates = [];
+  const verifiedDeadlines = [];
   const seenDates = new Set();
-  const addDateItem = (label, dateStr, isoDate, url) => {
-    if (!dateStr) return;
-    const key = (isoDate || dateStr).toLowerCase();
+  const anchorDate = reel?.created_at || null;
+
+  const addDateItem = (list, label, rawDate, explicitIso, url, isExternal = false, sourceNote = null) => {
+    if (!rawDate && !explicitIso) return;
+    const isoDate = resolveUsableIsoDate(explicitIso || rawDate, anchorDate, fullText);
+    const isUsable = Boolean(isoDate);
+    const displayDate = isUsable ? formatDisplayDate(isoDate, anchorDate, fullText) : String(rawDate || explicitIso).trim();
+
+    if (isPlaceholderDate(displayDate)) return;
+
+    const safeUrl = url && !isGenericRootUrl(url) ? url : (regUrl && !isGenericRootUrl(regUrl) ? regUrl : null);
+
+    const key = (isoDate || displayDate).toLowerCase();
     if (!seenDates.has(key)) {
       seenDates.add(key);
-      datesList.push({
-        label: label || "Actionable Date",
-        date: dateStr,
-        iso_date: isoDate || toInputDate(dateStr) || null,
-        url: url || regUrl || null,
+      list.push({
+        label: label || (isExternal ? "Verified External Deadline" : "Actionable Date"),
+        date: displayDate,
+        iso_date: isoDate,
+        is_usable: isUsable,
+        url: safeUrl,
+        is_external: isExternal,
+        badge: isExternal ? "Discovered via Deep Research" : "Extracted from Reel",
+        source_note: sourceNote || (isExternal ? "Found via external verification search" : "Directly mentioned in reel"),
       });
     }
   };
 
   (analysis.extracted_dates || []).forEach((d) => {
-    addDateItem(d.label, d.date, d.iso_date, d.url);
+    addDateItem(reelDates, d.label, d.date, d.iso_date, d.url, false, "Spoken / captioned in reel transcript");
   });
 
   (analysis.details?.dates || []).forEach((dStr) => {
@@ -361,8 +392,48 @@ function getExtractedData(reel) {
     } else if (low.includes("hackathon") || low.includes("finals") || low.includes("pitch")) {
       lbl = "Hackathon / Event Date";
     }
-    addDateItem(lbl, formatDate(dStr), toInputDate(dStr), regUrl);
+    addDateItem(reelDates, lbl, dStr, null, regUrl, false, "Extracted from reel details");
   });
+
+  // External verification results (Tavily search / Deep Cook)
+  const extDeadline =
+    tavilyResult?.official_deadline ||
+    reel.research?.verification?.official_deadline ||
+    reel.verification?.official_deadline;
+  if (extDeadline) {
+    addDateItem(
+      verifiedDeadlines,
+      `Official Deadline: ${reel.title || "Opportunity"}`,
+      extDeadline,
+      extDeadline,
+      tavilyResult?.sources?.[0]?.url || regUrl,
+      true,
+      "Externally discovered and corroborated by official web records (not mentioned in video audio)"
+    );
+  }
+
+  if (Array.isArray(tavilyResult?.claims)) {
+    tavilyResult.claims.forEach((claim) => {
+      const match =
+        claim.match(/\b(20\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01]))\b/) ||
+        claim.match(/\b(\d{1,2}(?:st|nd|rd|th)?\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)(?:\s+\d{4})?)\b/i);
+      if (match && /deadline|apply|close|last date/i.test(claim)) {
+        addDateItem(
+          verifiedDeadlines,
+          "Verified Application Deadline",
+          match[0],
+          null,
+          tavilyResult?.sources?.[0]?.url || regUrl,
+          true,
+          "Discovered via external research corroborating portal timeline"
+        );
+      }
+    });
+  }
+
+  const allDates = [...reelDates, ...verifiedDeadlines];
+  // Actionable dates count reflects only entries with established usable dates
+  const dates = allDates.filter((item) => item.is_usable && Boolean(item.iso_date));
 
   // 4. Explore section
   const explore = {
@@ -410,7 +481,10 @@ function getExtractedData(reel) {
   return {
     resources: resourcesList,
     links: allDetectedLinks,
-    dates: datesList,
+    dates: dates,
+    allDates,
+    reelDates,
+    verifiedDeadlines,
     explore,
   };
 }
@@ -426,6 +500,7 @@ function ExtractionResultCard({
   savedDates = [],
   isForYouActive,
   reelScore,
+  tavilyResult = null,
 }) {
   const [activeSection, setActiveSection] = useState(null);
   const [showAddDate, setShowAddDate] = useState(false);
@@ -463,7 +538,7 @@ function ExtractionResultCard({
     return (savedLinks || []).some((item) => (item.url || "").trim().toLowerCase() === clean);
   };
 
-  const { links, dates, explore } = getExtractedData(reel);
+  const { links, dates, reelDates, verifiedDeadlines, explore } = getExtractedData(reel, tavilyResult);
   const summary = reel.analysis?.summary || reel.caption || reel.transcript || "Summary not available.";
 
   // Detect if the reel relates to an internship, scheme, scholarship, hackathon, competition, or opportunity
@@ -494,69 +569,21 @@ function ExtractionResultCard({
     }
   }
 
-  // Look for official registration or application URL / Company reference link
-  let officialRegUrl = null;
-  let officialRegLabel = null;
+  // Look for official registration or application URL (strictly verified, no generic root fallbacks)
+  const candidateUrls = [
+    ...(analysis.resources || []).map((r) => r.url),
+    ...links.map((l) => l.url),
+    ...(analysis.sources || []).map((s) => s.url),
+    ...(tavilyResult?.sources || []).map((s) => s.url),
+  ].filter((u) => Boolean(u) && !isGenericRootUrl(u));
 
-  // 1. Direct registration / apply links (excluding generic google.com)
-  const regLink = links.find(
-    (l) =>
-      !isGenericGoogleUrl(l.url) &&
-      (/register|registration|apply|application|form|portal/i.test(l.url) ||
-        /register|apply|form|portal/i.test(l.contextLabel || ""))
-  );
+  const regCheck = findOfficialRegistrationLink(candidateUrls, schemeName || reel.title || "", explore.organizer || "");
+  const officialRegUrl = regCheck.url;
+  const officialRegLabel = regCheck.label;
+  const officialRegStatus = regCheck.status; // "verified" | "unable_to_verify" | "not_found"
 
-  if (regLink) {
-    officialRegUrl = regLink.url;
-    officialRegLabel = regLink.contextLabel || "Official Registration Page";
-  } else {
-    // 2. Check for company or organization link found in reel text (Microsoft, Adobe, Paytm, etc.)
-    const companyMatch = resolveCompanyLink(reel);
-    if (companyMatch) {
-      officialRegUrl = companyMatch.url;
-      officialRegLabel = companyMatch.label;
-    } else {
-      // 3. Official sources or resources from analysis (excluding generic google.com)
-      const sourceWithUrl = (analysis.sources || []).find(
-        (s) =>
-          s.url &&
-          !isGenericGoogleUrl(s.url) &&
-          !/(instagram\.com|tiktok\.com|youtube\.com|youtu\.be)/i.test(s.url)
-      );
-      const resourceWithUrl = (analysis.resources || []).find(
-        (r) =>
-          r.url &&
-          !isGenericGoogleUrl(r.url) &&
-          !/(instagram\.com|tiktok\.com|youtube\.com|youtu\.be)/i.test(r.url)
-      );
-
-      if (sourceWithUrl) {
-        officialRegUrl = sourceHref(sourceWithUrl.url);
-        officialRegLabel = sourceWithUrl.name || "Official Portal";
-      } else if (resourceWithUrl) {
-        officialRegUrl = sourceHref(resourceWithUrl.url);
-        officialRegLabel = resourceWithUrl.label || "Official Portal";
-      } else {
-        // 4. First non-social detected link that is not generic google.com
-        const firstNonSocial = links.find(
-          (l) =>
-            !isGenericGoogleUrl(l.url) &&
-            !/(instagram\.com|tiktok\.com|youtube\.com|youtu\.be)/i.test(l.url)
-        );
-        if (firstNonSocial) {
-          officialRegUrl = firstNonSocial.url;
-          officialRegLabel = `Official Page (${firstNonSocial.hostname})`;
-        }
-      }
-    }
-  }
-
-  // Ensure google.com is never given directly as the reference link
-  if (isGenericGoogleUrl(officialRegUrl)) {
-    const fallbackComp = resolveCompanyLink(reel);
-    officialRegUrl = fallbackComp ? fallbackComp.url : null;
-    officialRegLabel = fallbackComp ? fallbackComp.label : null;
-  }
+  // Company reference link (strictly separated from official registration)
+  const companyRef = resolveCompanyLink(reel);
 
   const webSearchQuery = schemeName
     ? `${schemeName} official registration portal application`
@@ -593,6 +620,7 @@ function ExtractionResultCard({
     const payload = {
       label,
       event_date: newDateValue.trim(),
+      title: reel.title,
       url: newDateUrl.trim() ? sourceHref(newDateUrl.trim()) : null,
     };
     const pref = localStorage.getItem("reelvault_pref_export");
@@ -608,14 +636,13 @@ function ExtractionResultCard({
   };
 
   const handleExportCalendar = (item) => {
-    const targetDate = item.iso_date || toInputDate(item.date);
+    const targetDate = item.iso_date || resolveUsableIsoDate(item.date);
     if (!targetDate) return;
     const pref = localStorage.getItem("reelvault_pref_export");
     if (pref === "google") {
       openGoogleCalendar(reel, item.label, targetDate);
-    } else {
-      onSaveDate(reel, { label: item.label, event_date: targetDate, url: item.url });
     }
+    onSaveDate(reel, { label: item.label, event_date: targetDate, title: reel.title, url: item.url });
   };
 
   return (
@@ -729,7 +756,20 @@ function ExtractionResultCard({
         </button>
         <button
           type="button"
-          onClick={() => setShowAddDate((prev) => !prev)}
+          onClick={() => {
+            setShowAddDate((prev) => {
+              const next = !prev;
+              if (next && !newDateValue) {
+                const defaultDate = (verifiedDeadlines && verifiedDeadlines[0]) || (reelDates && reelDates[0]);
+                if (defaultDate) {
+                  setNewDateLabel(defaultDate.label || `Important date for ${reel.title}`);
+                  setNewDateValue(defaultDate.iso_date || defaultDate.date || "");
+                  setNewDateUrl(defaultDate.url || "");
+                }
+              }
+              return next;
+            });
+          }}
           className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-bold uppercase tracking-wider transition-colors ${
             showAddDate
               ? "bg-[#8B5CF6] text-white border-[#8B5CF6]"
@@ -1048,8 +1088,7 @@ function ExtractionResultCard({
                   </form>
                 )}
 
-                {/* Requirement 3: If internship/scheme/hackathon is found:
-                    provide link to register to official page, or if not found give option to search on web */}
+                {/* Official Registration & Supporting Link Section */}
                 {isOpportunityOrScheme && (
                   <div className="mb-4 rounded-2xl border border-[#E3D4F8] bg-white p-4 shadow-2xs">
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -1062,9 +1101,13 @@ function ExtractionResultCard({
                             <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 border border-emerald-200 px-2 py-0.5 text-[10px] font-bold text-emerald-800">
                               <CheckCircle2 size={11} className="text-emerald-600" /> Official Link Available
                             </span>
-                          ) : (
+                          ) : officialRegStatus === "unable_to_verify" ? (
                             <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 border border-amber-200 px-2 py-0.5 text-[10px] font-bold text-amber-800">
-                              <Search size={11} className="text-amber-600" /> Direct Link Not in Video
+                              <AlertCircle size={11} className="text-amber-600" /> Unable to Verify Official Registration Link
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-gray-100 border border-gray-300 px-2 py-0.5 text-[10px] font-bold text-gray-700">
+                              <Search size={11} className="text-gray-500" /> Official registration link not found
                             </span>
                           )}
                         </div>
@@ -1073,12 +1116,19 @@ function ExtractionResultCard({
                         </h4>
                         <p className="text-xs text-gray-500 mt-1">
                           {officialRegUrl
-                            ? `Direct link to register or access official page for this ${explore.category?.toLowerCase() || "scheme"}:`
-                            : `The official link was not mentioned directly in the reel transcript. You can search on the web for the official page below:`}
+                            ? `Direct link to register or access official page for this ${explore.category?.toLowerCase() || "opportunity"}:`
+                            : officialRegStatus === "unable_to_verify"
+                            ? `Unable to verify official registration link matching this specific opportunity. Please check the organizer's original post or official event page to access authentic registration details. You can also search on the web below:`
+                            : `Official registration link not found in original post or verified records. Please check the organizer's original post or official event page, or search on the web below:`}
                         </p>
                         {officialRegUrl && (
                           <p className="mt-1 text-xs font-mono text-emerald-800 truncate">
                             {officialRegUrl}
+                          </p>
+                        )}
+                        {companyRef && !officialRegUrl && (
+                          <p className="mt-1 text-xs text-gray-400">
+                            Mentioned organizer homepage: <a href={companyRef.url} target="_blank" rel="noreferrer" className="underline hover:text-gray-600">{companyRef.label}</a> (Company reference only)
                           </p>
                         )}
                       </div>
@@ -1209,8 +1259,8 @@ function ExtractionResultCard({
 
             {/* 3) Dates Section View */}
             {activeSection === "dates" && (
-              <div>
-                <div className="flex items-center justify-between mb-3">
+              <div className="space-y-4">
+                <div className="flex items-center justify-between mb-1">
                   <p className="text-[10px] font-bold uppercase tracking-widest text-[#6D28D9] flex items-center gap-1.5">
                     <Calendar size={13} /> Actionable Dates & Deadlines
                   </p>
@@ -1218,43 +1268,132 @@ function ExtractionResultCard({
                     {dates.length} {dates.length === 1 ? "date" : "dates"}
                   </span>
                 </div>
-                {dates.length === 0 ? (
-                  <p className="text-xs text-gray-500 py-2">
-                    No dates mentioned in this reel. Click <strong>+ Add Date</strong> above to add one.
-                  </p>
-                ) : (
-                  <div className="space-y-2.5">
-                    {dates.map((item, idx) => (
-                      <div
-                        key={`${item.date}-${idx}`}
-                        className="rounded-xl bg-white border border-[#E3D4F8]/80 p-3.5 flex flex-wrap items-center justify-between gap-3 shadow-2xs"
-                      >
-                        <div>
-                          <p className="text-sm font-bold text-gray-900">{item.date}</p>
-                          <p className="text-xs font-semibold text-[#6D28D9] mt-0.5">{item.label}</p>
-                        </div>
-                        <div className="flex flex-wrap items-center gap-2">
-                          {item.url && (
-                            <a
-                              href={item.url}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="inline-flex items-center gap-1 rounded-lg bg-blue-50 border border-blue-200 px-2.5 py-1 text-xs font-bold text-blue-700 hover:bg-blue-100"
-                            >
-                              🔗 Register
-                            </a>
-                          )}
-                          <button
-                            type="button"
-                            onClick={() => handleExportCalendar(item)}
-                            className="inline-flex items-center gap-1 rounded-lg border border-gray-200 bg-gray-50 px-2.5 py-1 text-xs font-semibold text-gray-700 hover:bg-gray-100"
-                          >
-                            <CalendarPlus size={12} /> Add to Calendar
-                          </button>
-                        </div>
-                      </div>
-                    ))}
+
+                {/* Section A: Dates Extracted Directly from Reel Audio/Caption */}
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-gray-500">
+                      Dates Mentioned in Reel
+                    </span>
+                    <span className="rounded-full bg-purple-100 text-[#6D28D9] px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider">
+                      Extracted from Reel
+                    </span>
                   </div>
+
+                  {reelDates.length === 0 ? (
+                    <p className="text-xs text-gray-400 italic bg-white/60 rounded-xl p-3 border border-gray-100">
+                      No dates mentioned directly in the reel audio or caption.
+                    </p>
+                  ) : (
+                    <div className="space-y-2">
+                      {reelDates.map((item, idx) => (
+                        <div
+                          key={`reel-date-${item.date}-${idx}`}
+                          className="rounded-xl bg-white border border-[#E3D4F8]/80 p-3.5 flex flex-wrap items-center justify-between gap-3 shadow-2xs"
+                        >
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <p className="text-sm font-bold text-gray-900">{item.date}</p>
+                              <span className="text-[9px] font-bold uppercase px-2 py-0.5 rounded-full bg-purple-50 text-[#6D28D9] border border-purple-200">
+                                Spoken / In Reel
+                              </span>
+                            </div>
+                            <p className="text-xs font-semibold text-[#6D28D9] mt-0.5">{item.label}</p>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            {item.url && (
+                              <a
+                                href={item.url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="inline-flex items-center gap-1 rounded-lg bg-blue-50 border border-blue-200 px-2.5 py-1 text-xs font-bold text-blue-700 hover:bg-blue-100"
+                              >
+                                🔗 Register
+                              </a>
+                            )}
+                            {item.is_usable ? (
+                              <button
+                                type="button"
+                                onClick={() => handleExportCalendar(item)}
+                                className="inline-flex items-center gap-1 rounded-lg border border-[#8B5CF6]/30 bg-[#F0E8FF] px-2.5 py-1 text-xs font-semibold text-[#6D28D9] hover:bg-[#E3D4F8] transition-colors cursor-pointer"
+                              >
+                                <CalendarPlus size={12} /> Add to Calendar
+                              </button>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 rounded-lg bg-gray-100 border border-gray-200 px-2 py-0.5 text-[10px] font-medium text-gray-500">
+                                <Clock size={11} /> Unscheduled
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Section B: Externally Discovered & Verified Deadlines via Deep Analyze / Research */}
+                {verifiedDeadlines.length > 0 && (
+                  <div className="space-y-2 pt-2 border-t border-[#E3D4F8]/60">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-800">
+                        Externally Discovered & Verified Deadlines
+                      </span>
+                      <span className="rounded-full bg-emerald-100 text-emerald-800 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider">
+                        Discovered via Deep Research
+                      </span>
+                    </div>
+
+                    <div className="space-y-2">
+                      {verifiedDeadlines.map((item, idx) => (
+                        <div
+                          key={`ext-deadline-${item.date}-${idx}`}
+                          className="rounded-xl bg-emerald-50/70 border border-emerald-200 p-3.5 flex flex-wrap items-center justify-between gap-3 shadow-2xs"
+                        >
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <p className="text-sm font-bold text-gray-900">{item.date}</p>
+                              <span className="text-[9px] font-bold uppercase px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-900 border border-emerald-200">
+                                External Official Source
+                              </span>
+                            </div>
+                            <p className="text-xs font-semibold text-emerald-900 mt-0.5">{item.label}</p>
+                            <p className="text-[11px] text-gray-500 mt-0.5">{item.source_note}</p>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            {item.url && (
+                              <a
+                                href={item.url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="inline-flex items-center gap-1 rounded-lg bg-emerald-100 border border-emerald-300 px-2.5 py-1 text-xs font-bold text-emerald-900 hover:bg-emerald-200"
+                              >
+                                🔗 Portal
+                              </a>
+                            )}
+                            {item.is_usable ? (
+                              <button
+                                type="button"
+                                onClick={() => handleExportCalendar(item)}
+                                className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1 text-xs font-bold uppercase tracking-wider transition-colors shadow-xs cursor-pointer"
+                              >
+                                <CalendarPlus size={12} /> Add to Calendar
+                              </button>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 rounded-lg bg-gray-100 border border-gray-200 px-2 py-0.5 text-[10px] font-medium text-gray-500">
+                                <Clock size={11} /> Unscheduled
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {dates.length === 0 && (
+                  <p className="text-xs text-gray-500 py-1">
+                    No dates found in reel or deep research. Click <strong>+ Add Date</strong> above to add one.
+                  </p>
                 )}
               </div>
             )}
@@ -1317,14 +1456,17 @@ function DeepFridgePage({
   reels,
   language,
   onDelete,
+  onSaveDate,
   focusReelId,
   autoVerifyReelId,
   onClearAutoVerify,
+  resultsMap: externalResultsMap,
+  onUpdateResultsMap,
 }) {
   const [expandedTranscripts, setExpandedTranscripts] = useState({});
   const [minimizedVerifications, setMinimizedVerifications] = useState({});
   const [verifyingMap, setVerifyingMap] = useState({});
-  const [resultsMap, setResultsMap] = useState(() => {
+  const [internalResultsMap, setInternalResultsMap] = useState(() => {
     try {
       const cached = localStorage.getItem("reelvault_tavily_results");
       return cached ? JSON.parse(cached) : {};
@@ -1332,6 +1474,13 @@ function DeepFridgePage({
       return {};
     }
   });
+  const resultsMap = externalResultsMap || internalResultsMap;
+  const setResultsMap = (updater) => {
+    if (onUpdateResultsMap) {
+      onUpdateResultsMap(updater);
+    }
+    setInternalResultsMap(updater);
+  };
   const [errorMap, setErrorMap] = useState({});
 
   useEffect(() => {
@@ -1726,6 +1875,51 @@ function DeepFridgePage({
                           </div>
                         )}
 
+                        {/* Externally Discovered & Verified Deadline */}
+                        {(() => {
+                          const extIso = resolveUsableIsoDate(tavilyResult.official_deadline);
+                          if (!extIso) return null;
+                          return (
+                            <div className="rounded-xl border border-emerald-200 bg-emerald-50/90 p-4 shadow-2xs flex flex-wrap items-center justify-between gap-3">
+                              <div>
+                                <div className="flex items-center gap-1.5 mb-1">
+                                  <CalendarDays size={14} className="text-emerald-700" />
+                                  <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-800">
+                                    Externally Discovered & Verified Deadline
+                                  </span>
+                                  <span className="rounded-full bg-emerald-200/80 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wide text-emerald-950">
+                                    Deep Research
+                                  </span>
+                                </div>
+                                <p className="text-sm font-bold text-gray-900">
+                                  {formatDisplayDate(extIso)}
+                                </p>
+                                <p className="text-xs text-gray-600 mt-0.5">
+                                  Verified through official web records. Not explicitly spoken in the reel.
+                                </p>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const pref = localStorage.getItem("reelvault_pref_export");
+                                  if (pref === "google") {
+                                    openGoogleCalendar(reel, `Official Deadline: ${reel.title}`, extIso);
+                                  }
+                                  onSaveDate?.(reel, {
+                                    label: `Official Deadline: ${reel.title}`,
+                                    event_date: extIso,
+                                    title: reel.title,
+                                    url: tavilyResult.sources?.[0]?.url || reel.url,
+                                  });
+                                }}
+                                className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white px-3.5 py-2 text-xs font-bold uppercase tracking-wider transition-colors shadow-xs cursor-pointer"
+                              >
+                                <CalendarPlus size={14} /> Add to Calendar
+                              </button>
+                            </div>
+                          );
+                        })()}
+
                         {/* Top 3 Web Sources */}
                         <div>
                           <h4 className="text-xs font-bold uppercase tracking-wider text-[#6D28D9] mb-2.5 flex items-center gap-1.5">
@@ -2059,6 +2253,24 @@ export default function Vault() {
   const [isForYouActive, setIsForYouActive] = useState(false);
   const [filterType, setFilterType] = useState('All');
   const [filterDate, setFilterDate] = useState('All');
+  const [tavilyResults, setTavilyResults] = useState(() => {
+    try {
+      const cached = localStorage.getItem("reelvault_tavily_results");
+      return cached ? JSON.parse(cached) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  const handleUpdateTavilyResults = (updater) => {
+    setTavilyResults((prev) => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      try {
+        localStorage.setItem("reelvault_tavily_results", JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -2396,7 +2608,19 @@ export default function Vault() {
         </div>
       )}
 
-      {activeTab === "research" ? <DeepFridgePage reels={reels} language={language} onDelete={handleDelete} focusReelId={deepFridgeFocusId} autoVerifyReelId={autoVerifyReelId} onClearAutoVerify={() => setAutoVerifyReelId(null)} /> : activeTab === "shelf" ? <LinkShelf links={savedLinks} dates={savedDates} onDeleteLink={handleDeleteLink} onDeleteDate={handleDeleteDate} /> : activeTab === "calendar" ? (
+      {activeTab === "research" ? (
+        <DeepFridgePage
+          reels={reels}
+          language={language}
+          onDelete={handleDelete}
+          onSaveDate={handleSaveDate}
+          focusReelId={deepFridgeFocusId}
+          autoVerifyReelId={autoVerifyReelId}
+          onClearAutoVerify={() => setAutoVerifyReelId(null)}
+          resultsMap={tavilyResults}
+          onUpdateResultsMap={handleUpdateTavilyResults}
+        />
+      ) : activeTab === "shelf" ? <LinkShelf links={savedLinks} dates={savedDates} onDeleteLink={handleDeleteLink} onDeleteDate={handleDeleteDate} /> : activeTab === "calendar" ? (
         <section className="pt-2">
           <div className="mb-6">
             <p className="text-xs font-bold uppercase tracking-[0.2em] text-[#8B5CF6]">
@@ -2522,6 +2746,7 @@ export default function Vault() {
                 <ExtractionResultCard
                   key={reel.reel_id}
                   reel={reel}
+                  tavilyResult={tavilyResults[reel.reel_id]}
                   onSaveLink={handleSaveLink}
                   onSaveDate={handleSaveDate}
                   onDelete={handleDelete}

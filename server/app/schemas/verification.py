@@ -98,6 +98,8 @@ class DeadlineInfo(BaseModel):
     ambiguity_reason: str | None = None
     reminder_eligible: bool = False
     vault_reminder_status: Literal["not_connected", "ready_to_connect", "connected"] = "not_connected"
+    provenance: str | None = None
+    year_resolved_from: str | None = None
 
 
 # --- STAGE 2: CLAIMS ITEMS ---
@@ -269,6 +271,9 @@ class OpportunityCardPayload(BaseModel):
     scam_warnings: list[str] = Field(default_factory=list)
     claims_summary: list[ClaimVerdictItem] = Field(default_factory=list)
     official_links: list[str] = Field(default_factory=list)
+    official_registration_url: str | None = None
+    official_registration_status: Literal["verified", "not_found", "unable_to_verify"] = "not_found"
+    supporting_links: list[str] = Field(default_factory=list)
     deadline: DeadlineInfo = Field(default_factory=DeadlineInfo)
     can_save_reminder: bool = False
     vault_reminder_action: dict[str, Any] | None = None
@@ -320,3 +325,12 @@ class VaultReminderConnectOut(BaseModel):
     event_date: str
     status: str
     message: str
+
+
+class SaveToVaultOut(BaseModel):
+    success: bool = True
+    reel_id: int
+    title: str
+    already_saved: bool = False
+    message: str
+

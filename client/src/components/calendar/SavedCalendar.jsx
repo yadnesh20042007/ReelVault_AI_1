@@ -51,9 +51,15 @@ export default function SavedCalendar({
       if (!map.has(key)) map.set(key, []);
       
       const reel = reels?.find(r => r.reel_id === event.reel_id);
+      const title = event.title || event.opportunity_title || reel?.title || event.label || 'Saved Opportunity';
+      const source = event.source || event.url || reel?.url || (reel?.author ? `@${reel.author}` : null);
       map.get(key).push({
         id: event.id,
         label: event.label,
+        title,
+        event_date: event.event_date,
+        source,
+        reel_id: event.reel_id || reel?.reel_id,
         reel
       });
     });
@@ -268,7 +274,7 @@ export default function SavedCalendar({
               {displayEvents.map((event, i) => (
                 <div key={event.id || i} className="bg-[#F9ECF5]/60 rounded-2xl p-5 border border-[#E3D4F8]">
                   <h4 className="text-base font-bold text-[#261B33] mb-3 leading-snug">
-                    {event.reel?.title || 'Saved Opportunity'}
+                    {event.title || event.reel?.title || 'Saved Opportunity'}
                   </h4>
                   
                   <div className="space-y-2 mb-4">
@@ -284,10 +290,14 @@ export default function SavedCalendar({
                       </div>
                     )}
                     
-                    {event.reel?.author && (
+                    {(event.reel?.author || event.source) && (
                       <div className="flex flex-col">
-                        <span className="text-[10px] font-bold uppercase tracking-widest text-[#776A83]">Provider</span>
-                        <span className="text-sm font-medium text-[#261B33]">{event.reel.author}</span>
+                        <span className="text-[10px] font-bold uppercase tracking-widest text-[#776A83]">
+                          {event.reel?.author ? 'Provider' : 'Source'}
+                        </span>
+                        <span className="text-sm font-medium text-[#261B33] truncate">
+                          {event.reel?.author || event.source}
+                        </span>
                       </div>
                     )}
                   </div>
@@ -295,8 +305,8 @@ export default function SavedCalendar({
                   <button
                     type="button"
                     onClick={() => {
-                      if (onViewOpportunity && event.reel?.reel_id) {
-                        onViewOpportunity(event.reel.reel_id);
+                      if (onViewOpportunity && (event.reel_id || event.reel?.reel_id)) {
+                        onViewOpportunity(event.reel_id || event.reel?.reel_id);
                       }
                     }}
                     className="w-full bg-gradient-to-r from-[#8B5CF6] to-[#6D28D9] hover:from-[#7C3AED] hover:to-[#5B21B6] text-white transition-all rounded-xl py-2.5 text-xs font-bold uppercase tracking-widest flex items-center justify-center gap-1.5 shadow-xs cursor-pointer"

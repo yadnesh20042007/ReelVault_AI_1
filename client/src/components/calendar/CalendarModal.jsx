@@ -14,20 +14,24 @@ import { api } from '../../services/api';
 export default function CalendarModal({ isOpen, onClose }) {
   const navigate = useNavigate();
   const [reels, setReels] = useState([]);
+  const [savedDates, setSavedDates] = useState([]);
   const [loading, setLoading] = useState(false);
   const [selectedKey, setSelectedKey] = useState('');
 
-  // Fetch reels when modal is opened
+  // Fetch reels and saved dates when modal is opened
   useEffect(() => {
     if (!isOpen) return;
     let active = true;
     setLoading(true);
-    api.listReels()
-      .then((data) => {
-        if (active) setReels(Array.isArray(data) ? data : []);
-      })
-      .catch(() => {
-        if (active) setReels([]);
+    Promise.all([
+      api.listReels().catch(() => []),
+      api.listSavedDates().catch(() => []),
+    ])
+      .then(([reelsData, datesData]) => {
+        if (active) {
+          setReels(Array.isArray(reelsData) ? reelsData : []);
+          setSavedDates(Array.isArray(datesData) ? datesData : []);
+        }
       })
       .finally(() => {
         if (active) setLoading(false);
@@ -50,11 +54,17 @@ export default function CalendarModal({ isOpen, onClose }) {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isOpen, onClose]);
 
-  // Filter reels for selected day
+  // Filter reels and deadlines for selected day
   const selectedReels = useMemo(() => {
     if (!selectedKey) return [];
-    return reels.filter((r) => dateKey(r.created_at) === selectedKey);
-  }, [reels, selectedKey]);
+    return reels.filter((r) => {
+      const createdMatch = dateKey(r.created_at) === selectedKey;
+      const dateMatch = savedDates.some(
+        (d) => Number(d.reel_id) === Number(r.reel_id) && dateKey(`${d.event_date}T00:00:00`) === selectedKey
+      );
+      return createdMatch || dateMatch;
+    });
+  }, [reels, savedDates, selectedKey]);
 
   if (!isOpen) return null;
 
@@ -105,6 +115,7 @@ export default function CalendarModal({ isOpen, onClose }) {
           {/* Calendar Widget */}
           <SavedCalendar
             reels={reels}
+            importantDates={savedDates}
             selectedKey={selectedKey}
             onSelect={setSelectedKey}
           />

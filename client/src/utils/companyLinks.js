@@ -228,6 +228,162 @@ export function isGenericGoogleUrl(url) {
   }
 }
 
+/**
+ * Checks whether a URL is a generic root homepage (e.g. https://www.nvidia.com or https://microsoft.com/)
+ * with no event, opportunity, or registration path.
+ */
+export function isGenericRootUrl(url) {
+  if (!url) return false;
+  try {
+    const raw = String(url).trim();
+    const parsed = new URL(raw.startsWith("http") ? raw : `https://${raw}`);
+    const p = parsed.pathname.replace(/\/+$/, "").toLowerCase();
+    const isRoot = p === "" || /^\/(?:en|en-[a-z]{2}|in|us|global)?$/i.test(p);
+    return isRoot && !parsed.search && !parsed.hash;
+  } catch {
+    return false;
+  }
+}
+
+const DEDICATED_OPPORTUNITY_DOMAINS = new Set([
+  "summerofcode.withgoogle.com",
+  "buildyourfuture.withgoogle.com",
+  "aifoundersgrant.org",
+  "stemleadersfund.org",
+  "devpost.com",
+  "unstop.com",
+  "mlh.io",
+  "hackerearth.com",
+  "kaggle.com",
+]);
+
+const SOCIAL_OR_AGGREGATOR_DOMAINS = new Set([
+  "instagram.com",
+  "facebook.com",
+  "tiktok.com",
+  "youtube.com",
+  "youtu.be",
+  "twitter.com",
+  "x.com",
+  "linkedin.com",
+  "reddit.com",
+  "bit.ly",
+  "tinyurl.com",
+  "t.co",
+]);
+
+/**
+ * Verifies whether a candidate URL actually relates to the specific opportunity
+ * rather than being a generic corporate root homepage, social post, or search engine.
+ */
+export function verifyRegistrationLink(url, opportunityTitle = "", organizer = "") {
+  if (!url) {
+    return { isValid: false, status: "not_found", reason: "No link provided." };
+  }
+
+  if (isGenericGoogleUrl(url)) {
+    return { isValid: false, status: "unable_to_verify", reason: "Generic search engine URL." };
+  }
+
+  let parsed;
+  try {
+    const raw = String(url).trim();
+    parsed = new URL(raw.startsWith("http") ? raw : `https://${raw}`);
+  } catch {
+    return { isValid: false, status: "unable_to_verify", reason: "Invalid URL format." };
+  }
+
+  const hostname = parsed.hostname.replace(/^www\./, "").toLowerCase();
+
+  // 1. Reject social media, aggregators, link shorteners
+  for (const blocked of SOCIAL_OR_AGGREGATOR_DOMAINS) {
+    if (hostname === blocked || hostname.endsWith(`.${blocked}`)) {
+      return { isValid: false, status: "unable_to_verify", reason: "Social media or shortener URL." };
+    }
+  }
+
+  // 2. Check if dedicated opportunity domain
+  for (const dedicated of DEDICATED_OPPORTUNITY_DOMAINS) {
+    if (hostname === dedicated || hostname.endsWith(`.${dedicated}`)) {
+      return { isValid: true, status: "verified", reason: "Dedicated opportunity domain." };
+    }
+  }
+
+  const path = parsed.pathname.toLowerCase();
+  const search = parsed.search.toLowerCase();
+  const fullPath = `${path}${search}`;
+
+  // 3. Reject generic root homepage of large companies/organizations
+  if (isGenericRootUrl(url)) {
+    return {
+      isValid: false,
+      status: "unable_to_verify",
+      reason: `Generic corporate homepage (${hostname}) is not an official registration link.`,
+    };
+  }
+
+  // 4. Check for registration/opportunity path intent
+  const hasRegIntent = /(?:register|registration|apply|application|signup|sign-up|portal|form|participate|contest|challenge|hackathon|internship|fellowship|scholarship|grants|careers|jobs)/i.test(fullPath);
+
+  // 5. Check for opportunity title or organizer tokens in path
+  const tokens = `${opportunityTitle} ${organizer}`
+    .toLowerCase()
+    .split(/[\s,._-]+/)
+    .filter((t) => t.length >= 3 && !/^(the|and|for|with|from|2026|hackathon|grant|program|opportunity)$/i.test(t));
+
+  const hasTokenMatch = tokens.some((token) => fullPath.includes(token) || hostname.includes(token));
+
+  if (hasRegIntent && hasTokenMatch) {
+    return { isValid: true, status: "verified", reason: "Verified registration path with opportunity keywords." };
+  }
+
+  if (hasRegIntent) {
+    return { isValid: true, status: "verified", reason: "Registration path detected on official domain." };
+  }
+
+  if (hasTokenMatch && path.length > 3) {
+    return { isValid: true, status: "verified", reason: "Dedicated opportunity page detected on official domain." };
+  }
+
+  return {
+    isValid: false,
+    status: "unable_to_verify",
+    reason: "Link does not show direct relation or registration intent for this opportunity.",
+  };
+}
+
+/**
+ * Searches candidate URLs from analysis, resources, and links to find an authentic official registration link.
+ * Never defaults to corporate root homepages.
+ */
+export function findOfficialRegistrationLink(candidateUrls = [], opportunityTitle = "", organizer = "") {
+  for (const rawUrl of candidateUrls) {
+    if (!rawUrl) continue;
+    const check = verifyRegistrationLink(rawUrl, opportunityTitle, organizer);
+    if (check.isValid) {
+      let label = "Official Registration Page";
+      if (/apply/i.test(rawUrl)) label = "Official Application Portal";
+      else if (/hackathon/i.test(rawUrl)) label = "Official Hackathon Portal";
+      return {
+        url: rawUrl.startsWith("http") ? rawUrl : `https://${rawUrl}`,
+        label,
+        status: "verified",
+        reason: check.reason,
+      };
+    }
+  }
+
+  return {
+    url: null,
+    label: null,
+    status: candidateUrls.length > 0 ? "unable_to_verify" : "not_found",
+    reason: "Official registration link not found in verified sources.",
+  };
+}
+
+/**
+ * Backward compatibility: returns company reference info WITHOUT labeling it as an official registration link.
+ */
 export function resolveCompanyLink(reel) {
   if (!reel) return null;
   const analysis = reel.analysis || {};
@@ -242,41 +398,18 @@ export function resolveCompanyLink(reel) {
     ...(analysis.tags || []),
   ].join(" ");
 
-  // 1. Check known company/organization matches
   for (const comp of KNOWN_COMPANIES) {
     if (comp.regex.test(textToScan)) {
       return {
         name: comp.name,
         domain: comp.domain,
         url: comp.url,
-        label: `${comp.name} Official Portal (${comp.domain})`,
+        label: `${comp.name} (${comp.domain})`,
+        isGenericRoot: true,
       };
     }
   }
 
-  // 2. Check candidate links that are valid and non-generic-google
-  const candidateUrls = [
-    ...(analysis.sources || []).map((s) => s.url),
-    ...(analysis.resources || []).map((r) => r.url),
-    ...(analysis.links || []),
-  ].filter(Boolean);
-
-  for (const rawUrl of candidateUrls) {
-    if (isGenericGoogleUrl(rawUrl)) continue;
-    if (/(instagram\.com|tiktok\.com|youtube\.com|youtu\.be|facebook\.com)/i.test(rawUrl)) continue;
-    try {
-      const u = new URL(rawUrl.startsWith("http") ? rawUrl : `https://${rawUrl}`);
-      const hostname = u.hostname.replace(/^www\./, "");
-      if (hostname && !hostname.includes("google.com")) {
-        return {
-          name: hostname,
-          domain: hostname,
-          url: rawUrl.startsWith("http") ? rawUrl : `https://${rawUrl}`,
-          label: `Official Page (${hostname})`,
-        };
-      }
-    } catch {}
-  }
-
   return null;
 }
+

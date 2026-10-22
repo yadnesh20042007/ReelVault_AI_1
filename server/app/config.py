@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     gemini_api_keys: list[str] | str = []
     llm_model_fast: str = "gemini-3-flash-preview"
     llm_model_main: str = "gemini-3-flash-preview"
+    llm_fallback_models: list[str] = Field(
+        default=["gemini-3.5-flash-lite", "gemini-3.8-flash"],
+        validation_alias=AliasChoices(
+            "llm_fallback_models", "gemini_fallback_models", "llm_model_fallbacks"
+        ),
+    )
     # Fail fast per key so we can immediately rotate/fallback to the next
     # configured key when a quota limit or rate limit is reached.
     llm_max_retries: int = 0
@@ -97,6 +103,31 @@ class Settings(BaseSettings):
 
         # supabase-py appends service paths such as `/rest/v1` itself.
         return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+
+    @field_validator("llm_fallback_models", mode="before")
+    @classmethod
+    def normalize_fallback_models(cls, value: object) -> list[str]:
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
+            if value.startswith("[") and value.endswith("]"):
+                try:
+                    import json
+                    parsed = json.loads(value)
+                    if isinstance(parsed, list):
+                        return [str(item).strip() for item in parsed if str(item).strip()]
+                except Exception:
+                    pass
+            return [m.strip() for m in value.split(",") if m.strip()]
+        if isinstance(value, list):
+            return [str(m).strip() for m in value if str(m).strip()]
+        return ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
+
+    def get_llm_fallback_models(self) -> list[str]:
+        if isinstance(self.llm_fallback_models, list):
+            return [m for m in self.llm_fallback_models if m]
+        return ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
 
     def get_all_gemini_keys(self) -> list[str]:
         keys: list[str] = []

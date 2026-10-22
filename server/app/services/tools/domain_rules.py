@@ -331,8 +331,8 @@ def evaluate_organizer_relationship(
         compact_core = "".join(core_tokens)
         if len(compact_core) >= 5 and (main_label == compact_core or reg_domain.startswith(compact_core + ".")):
             return True, "official_organizer", f"Official domain matching core organization name '{compact_core}'"
-        # Truncation or suffix match for significant compound names (e.g. redcross in americanredcross)
-        if len(main_label) >= 6 and (compact_org.endswith(main_label) or compact_org.startswith(main_label)):
+        # Truncation or suffix match for significant compound names (e.g. redcross in americanredcross, aifoundersgrant starts with aifounders)
+        if len(main_label) >= 6 and (compact_org.endswith(main_label) or compact_org.startswith(main_label) or main_label.startswith(compact_org)):
             return True, "official_organizer", f"Official domain matching organization component '{main_label}'"
 
     # Check 5: Corporate Outreach / Program Portals (e.g. summerofcode.withgoogle.com, join{org}.com)
@@ -505,3 +505,137 @@ def classify_source(
 def check_domain(url: str, organizer: str = "") -> dict:
     """Backward-compatible wrapper for toolkit.py and legacy callers."""
     return classify_source(url=url, organizer=organizer)
+
+
+def is_generic_root_url(url: str) -> bool:
+    """Determine whether a URL is a generic root domain / homepage (e.g. https://www.nvidia.com or https://iitb.ac.in/)."""
+    if not url or not isinstance(url, str):
+        return False
+    cleaned = url.strip()
+    if not cleaned:
+        return False
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", cleaned):
+        cleaned = "https://" + cleaned
+    try:
+        parsed = urlsplit(cleaned)
+        path = (parsed.path or "").strip()
+        if (not path or path == "/") and not parsed.query:
+            return True
+        if re.match(r"^/(?:index\.(?:html|php|asp|htm)|home|default\.(?:html|aspx)|en|en-[a-zA-Z]{2}|in|us|global)?/?$", path, re.IGNORECASE) and not parsed.query:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def verify_official_registration_link(
+    url: str,
+    organizer: str = "",
+    title: str = "",
+    category: str = "",
+    evidence_items: list[dict] | None = None,
+) -> tuple[bool, str, str]:
+    """Verify whether a candidate URL actually relates to the specific opportunity as an official registration link.
+    
+    Returns:
+        (is_official_reg: bool, status: "verified" | "not_found" | "unable_to_verify", reason: str)
+    """
+    if not url or not isinstance(url, str) or not url.strip():
+        return False, "not_found", "No registration link provided."
+
+    cleaned_url = url.strip()
+    host = extract_hostname(cleaned_url)
+    if not host:
+        return False, "unable_to_verify", "Invalid link format."
+
+    # 1. Reject generic search engines, social media, url shorteners
+    if host in {"google.com", "www.google.com"} or host in SHORTENERS or any(host == d or host.endswith("." + d) for d in SOCIAL_DOMAINS):
+        return False, "unable_to_verify", "Social media, search result, or shortener cannot serve as an official registration link."
+
+    # 2. Reject third-party generic directories as official registration link
+    if any(host == d or host.endswith("." + d) for d in GENERIC_DIRECTORIES):
+        return False, "unable_to_verify", "Third-party directory aggregator is not an official registration link."
+
+    reg_domain, main_label, _ = get_domain_parts(host)
+
+    # 3. Dedicated event portals where domain itself represents the opportunity
+    title_clean = (title or "").lower().strip()
+    raw_title_words = [w for w in re.findall(r"[a-z0-9]+", title_clean) if len(w) >= 2 and w not in STOP]
+    title_words_no_years = [w for w in raw_title_words if not re.match(r"^(?:20\d\d)$", w)]
+    compact_title = "".join(title_words_no_years)
+
+    title_tokens = [w for w in title_words_no_years if len(w) >= 3 and w not in GENERIC_OPPORTUNITY_TERMS]
+    org_tokens = set(re.findall(r"[a-z0-9]+", (organizer or "").lower()))
+    event_tokens = [t for t in title_tokens if t not in org_tokens]
+
+    GENERIC_ORG_DOMAINS = {
+        "amazon.com", "microsoft.com", "google.com", "nvidia.com", "apple.com", "meta.com",
+        "adobe.com", "ibm.com", "oracle.com", "salesforce.com", "intel.com", "cisco.com",
+        "netflix.com", "spotify.com", "uber.com", "flipkart.com", "swiggy.com", "zomato.com",
+        "paytm.com", "tcs.com", "infosys.com", "wipro.com", "harvard.edu", "mit.edu", "stanford.edu",
+    }
+
+    is_dedicated_event_domain = bool(
+        host not in GENERIC_ORG_DOMAINS
+        and reg_domain not in GENERIC_ORG_DOMAINS
+        and (
+            (len(compact_title) >= 6 and (compact_title in host or main_label in compact_title))
+            or (
+                event_tokens
+                and (
+                    any(t in host for t in event_tokens if len(t) >= 4)
+                    or (len(event_tokens) >= 2 and all(t in host for t in event_tokens[:2]))
+                )
+            )
+        )
+    )
+
+    if is_dedicated_event_domain:
+        return True, "verified", "Dedicated opportunity domain."
+
+    # 4. Reject generic corporate / institutional root homepages unless it's a dedicated event domain
+    if is_generic_root_url(cleaned_url) and not is_dedicated_event_domain:
+        return False, "unable_to_verify", "Generic organization root homepage is not an official registration link."
+
+    # 5. Evaluate authority and relationship of host
+    cls_info = classify_source(cleaned_url, organizer=organizer, event_title=title, category=category)
+    source_type = cls_info.get("source_type")
+    domain_trust = cls_info.get("domain_trust")
+
+    if source_type == "unverified_suspicious":
+        return False, "unable_to_verify", "Unverified or suspicious source domain."
+    if source_type == "unrelated_institution":
+        return False, "unable_to_verify", "Domain belongs to an unrelated institution."
+
+    # 6. Check for registration / application intent in path or query
+    parsed = urlsplit(cleaned_url if "://" in cleaned_url else f"https://{cleaned_url}")
+    url_path = (parsed.path + ("?" + parsed.query if parsed.query else "")).lower()
+
+    REGISTRATION_INDICATORS = (
+        "register", "registration", "apply", "application", "signup", "sign-up",
+        "form", "forms", "submit", "submission", "portal", "join", "admissions",
+        "careers", "jobs", "scholarship", "hackathon", "contest", "grant", "fellowship",
+    )
+
+    has_reg_path = any(ind in url_path for ind in REGISTRATION_INDICATORS)
+    has_title_in_path = bool(title_tokens and any(t in url_path for t in title_tokens))
+
+    # If domain is official organizer or trusted institution, and path has registration intent or matches event:
+    if source_type in {"official_organizer", "trusted_institution"} and domain_trust in {"official_match", "high"}:
+        if has_reg_path or has_title_in_path or is_dedicated_event_domain:
+            return True, "verified", "Corroborated official organizer registration page."
+
+    # If supported by evidence: check if evidence items corroborate this URL
+    if evidence_items:
+        for ev in evidence_items:
+            ev_url = ev.get("url") if isinstance(ev, dict) else getattr(ev, "url", None)
+            if ev_url and ev_url.lower() == cleaned_url.lower():
+                ev_type = ev.get("source_type") if isinstance(ev, dict) else getattr(ev, "source_type", None)
+                if ev_type in {"official_organizer", "trusted_institution"} and (has_reg_path or has_title_in_path or is_dedicated_event_domain):
+                    return True, "verified", "Corroborated by verified official evidence."
+
+    # If domain matches organizer but path has no registration intent or event match:
+    if source_type == "official_organizer":
+        return False, "unable_to_verify", "Organizer domain page lacks registration or event details."
+
+    return False, "unable_to_verify", "Unable to verify as official registration link."

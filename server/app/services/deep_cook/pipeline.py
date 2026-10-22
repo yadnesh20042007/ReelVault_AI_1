@@ -1,9 +1,14 @@
 import logging
 
-from google.api_core.exceptions import ResourceExhausted
+from google.api_core.exceptions import ResourceExhausted, TooManyRequests
 
 from app.db import repo
 from app.errors import PipelineError
+from app.llm import (
+    ModelQuotaError,
+    is_auth_error,
+    is_quota_or_rate_limit_error,
+)
 from app.schemas.domain import Extracted, FetchedPost, Verdict, VerificationResult
 from app.services.deep_cook.classify import classify
 from app.services.deep_cook.extract import extract
@@ -106,11 +111,16 @@ def run_deep_cook(
             rep = research(ex, ver, run)
             repo.update_deep_cook(deep_cook_id, report=rep.model_dump(mode="json"))
         _set(deep_cook_id, "done")
-    except ResourceExhausted:
-        log.warning("deep_cook=%s stopped: Gemini quota or rate limit reached", deep_cook_id)
+    except (ResourceExhausted, TooManyRequests, ModelQuotaError):
+        log.warning("deep_cook=%s stopped: Gemini quota or rate limit reached across all models", deep_cook_id)
         _set(deep_cook_id, "failed", error_code="ai_rate_limited")
     except PipelineError as e:
         _set(deep_cook_id, "failed", error_code=e.code)
-    except Exception:
+    except Exception as exc:
         log.exception("deep_cook=%s unexpected failure", deep_cook_id)
-        _set(deep_cook_id, "failed", error_code="internal_error")
+        if is_quota_or_rate_limit_error(exc):
+            _set(deep_cook_id, "failed", error_code="ai_rate_limited")
+        elif is_auth_error(exc):
+            _set(deep_cook_id, "failed", error_code="ai_auth_error")
+        else:
+            _set(deep_cook_id, "failed", error_code="internal_error")

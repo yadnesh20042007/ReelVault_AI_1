@@ -83,7 +83,15 @@ def _saved_link_out(row: dict) -> SavedLinkOut:
 
 
 def _saved_date_out(row: dict) -> SavedDateOut:
-    return SavedDateOut(id=row["id"], reel_id=row["user_reel_id"], label=row["label"], event_date=str(row["event_date"]), created_at=row["created_at"])
+    return SavedDateOut(
+        id=row["id"],
+        reel_id=row["user_reel_id"],
+        label=row["label"],
+        event_date=str(row["event_date"]),
+        title=row.get("title") or row.get("label"),
+        url=row.get("url"),
+        created_at=row["created_at"],
+    )
 
 
 def _link_vault_entry_out(row: dict) -> LinkVaultEntryOut:
@@ -104,7 +112,28 @@ def list_saved_links(user: AuthUser = Depends(current_user)):
 
 @router.get("/saved-dates", response_model=list[SavedDateOut])
 def list_saved_dates(user: AuthUser = Depends(current_user)):
-    return [_saved_date_out(row) for row in repo.list_saved_dates(user.id)]
+    dates = repo.list_saved_dates(user.id)
+    user_reels = {r["id"]: r for r in repo.list_user_reels(user.id, limit=100)}
+    results = []
+    for row in dates:
+        row_dict = dict(row)
+        reel_id = row_dict.get("user_reel_id")
+        if reel_id and not row_dict.get("title"):
+            r = user_reels.get(reel_id)
+            if not r:
+                try:
+                    r = repo.get_user_reel(user.id, reel_id)
+                    if r:
+                        user_reels[reel_id] = r
+                except Exception:
+                    pass
+            if r:
+                post = r.get("source_posts") or {}
+                row_dict["title"] = reel_title(post)
+                if not row_dict.get("url"):
+                    row_dict["url"] = post.get("url")
+        results.append(_saved_date_out(row_dict))
+    return results
 
 
 @router.get("/link-vault", response_model=list[LinkVaultEntryOut])
@@ -128,9 +157,19 @@ def delete_saved_link(link_id: int, user: AuthUser = Depends(current_user)):
 
 @router.post("/{reel_id}/saved-dates", response_model=SavedDateOut)
 def save_date(reel_id: int, body: SavedDateIn, user: AuthUser = Depends(current_user)):
-    if repo.get_user_reel(user.id, reel_id) is None:
+    reel = repo.get_user_reel(user.id, reel_id)
+    if reel is None:
         raise NotFound("reel not found")
-    return _saved_date_out(repo.save_date(user.id, reel_id, body.label.strip(), body.event_date))
+    post = _source_post(reel) if reel else {}
+    title = body.title or (reel_title(post) if post else None) or body.label.strip()
+    url = body.url or (post.get("url") if post else None)
+    saved = repo.save_date(user.id, reel_id, body.label.strip(), body.event_date)
+    if not saved or not saved.get("id"):
+        raise UpstreamFailed("Failed to persist saved date.")
+    saved_dict = dict(saved)
+    saved_dict["title"] = title
+    saved_dict["url"] = url
+    return _saved_date_out(saved_dict)
 
 
 @router.post("/{reel_id}/link-vault", response_model=LinkVaultEntryOut)
@@ -238,6 +277,7 @@ class _AIVerdict(BaseModel):
     verdict: Literal["True", "Partially True", "False", "Unverified"] = "Partially True"
     explanation: str = Field(description="Concise 2-3 sentence explanation based on the retrieved evidence.")
     claims: list[str] = Field(default_factory=list, description="2-3 key factual claims verified from the reel.")
+    official_deadline: str | None = Field(default=None, description="Discovered application deadline (YYYY-MM-DD), or null if none discovered.")
 
 
 @router.post("/{reel_id}/verify-tavily", response_model=TavilyVerifyOut)
@@ -314,6 +354,7 @@ def verify_reel_with_tavily(
         elif title:
             claims = [title]
 
+        official_deadline = None
         if settings.gemini_api_key:
             try:
                 evidence_text = "\n\n".join(
@@ -330,7 +371,8 @@ def verify_reel_with_tavily(
                         "- 'Partially True': If core idea is valid but some details (dates, eligibility, stipends) differ, or only partially backed.\n"
                         "- 'False': If web evidence directly contradicts the claims or indicates a hoax/scam.\n"
                         "- 'Unverified': If web evidence is completely inconclusive or unrelated.\n"
-                        "Provide a concise 2-3 sentence explanation and extract 1-3 key factual claims."
+                        "Provide a concise 2-3 sentence explanation and extract 1-3 key factual claims.\n"
+                        "If an official application deadline is confirmed in the external sources, specify it as YYYY-MM-DD in official_deadline; otherwise null."
                     ),
                     HumanMessage(f"Reel to verify:\n{target_text}\n\nRetrieved Web Evidence:\n{evidence_text}")
                 ])
@@ -338,12 +380,22 @@ def verify_reel_with_tavily(
                 explanation = ai_res.explanation
                 if ai_res.claims:
                     claims = ai_res.claims
+                if getattr(ai_res, "official_deadline", None):
+                    official_deadline = ai_res.official_deadline
             except Exception as ai_err:
                 logging.getLogger("verify").warning("AI verdict evaluation fallback: %s", ai_err)
                 if any(s.score and s.score > 0.7 for s in sources):
                     verdict = "True"
                 else:
                     verdict = "Partially True"
+
+        # Regex fallback for discovering dates in source snippets if not extracted by LLM
+        if not official_deadline:
+            for s in sources:
+                date_match = re.search(r"\b(20\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01]))\b", f"{s.title} {s.summary}")
+                if date_match:
+                    official_deadline = date_match.group(1)
+                    break
 
         return TavilyVerifyOut(
             verified=True,
@@ -353,6 +405,7 @@ def verify_reel_with_tavily(
             query=query,
             sources=sources,
             summary=f"Found {len(sources)} verified web source(s) via Tavily search.",
+            official_deadline=official_deadline,
         )
     except Exception as exc:
         raise UpstreamFailed(f"Tavily search failed: {exc}")

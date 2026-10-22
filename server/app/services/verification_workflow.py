@@ -3,7 +3,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from google.api_core.exceptions import ResourceExhausted, TooManyRequests
@@ -13,7 +13,15 @@ from app.config import get_settings
 from app.db import repo as main_repo
 from app.db import verification_repo
 from app.errors import AppError, PipelineError, ProviderTimeout
-from app.llm import _is_key_or_quota_error, get_llm
+from app.llm import (
+    ModelQuotaError,
+    _is_key_or_quota_error,
+    get_llm,
+    is_auth_error,
+    is_invalid_argument_error,
+    is_not_found_error,
+    is_quota_or_rate_limit_error,
+)
 from app.schemas.verification import (
     ClaimItem,
     ClaimVerdictItem,
@@ -38,6 +46,8 @@ from app.services.tools.domain_rules import (
     STOP,
     check_domain,
     classify_source,
+    is_generic_root_url,
+    verify_official_registration_link,
 )
 
 log = logging.getLogger("verification_workflow")
@@ -63,14 +73,6 @@ def _classify_gemini_error(exc: Exception) -> tuple[bool, int, str, str]:
             "Gemini model request timed out (504 DEADLINE_EXCEEDED). You can retry or resume this verification run.",
         )
 
-    if isinstance(exc, (ResourceExhausted, TooManyRequests)):
-        return (
-            True,
-            429,
-            "gemini_rate_limited",
-            "Gemini API rate limit reached. Please wait a moment and resume.",
-        )
-
     msg = str(exc).lower()
 
     # 1. 504 / DEADLINE_EXCEEDED / Timeout
@@ -82,30 +84,48 @@ def _classify_gemini_error(exc: Exception) -> tuple[bool, int, str, str]:
             "Gemini model request timed out (504 DEADLINE_EXCEEDED). You can retry or resume this verification run.",
         )
 
-    # 2. Distinguish malformed output / schema parse failures: these are NOT transient provider errors
-    is_schema_parse = any(p in msg for p in ("schema parse", "outputparser", "jsondecodeerror", "validation error"))
-    if is_schema_parse:
-        return False, 422, "malformed_model_output", f"Model produced malformed or invalid output: {exc}"
-
-    # 3. 429 / Rate limit / Resource exhausted
-    if any(k in msg for k in ("429", "resource_exhausted", "resourceexhausted", "quota", "rate limit", "too many requests")):
-        return (
-            True,
-            429,
-            "gemini_rate_limited",
-            "Gemini API rate limit reached. Please wait a moment and resume.",
-        )
-
-    # 4. Authentication / Key errors
-    if any(k in msg for k in ("api_key_invalid", "unauthenticated", "invalid api key")):
+    # 2. Authentication / Key errors (evaluated before quota to prevent misclassifying invalid keys)
+    if is_auth_error(exc):
         return (
             False,
             401,
             "gemini_auth_error",
-            "Invalid or unauthenticated Gemini API key.",
+            "Invalid or unauthenticated Gemini API key. Please verify your GEMINI_API_KEY credentials.",
         )
 
-    # 5. 503 / 502 / Service unavailable / Server errors
+    # 3. Model Not Found / Unsupported Model Identifier (404)
+    if is_not_found_error(exc):
+        return (
+            False,
+            404,
+            "gemini_model_not_found",
+            f"Configured Gemini model not found or unsupported ({exc}).",
+        )
+
+    # 4. Bad request / Invalid Argument (400)
+    if is_invalid_argument_error(exc):
+        return (
+            False,
+            400,
+            "gemini_invalid_argument",
+            f"Invalid request parameters to Gemini model: {exc}",
+        )
+
+    # 5. Distinguish malformed output / schema parse failures: these are NOT transient provider errors
+    is_schema_parse = any(p in msg for p in ("schema parse", "outputparser", "jsondecodeerror", "validation error"))
+    if is_schema_parse:
+        return False, 422, "malformed_model_output", f"Model produced malformed or invalid output: {exc}"
+
+    # 6. 429 / Rate limit / Resource exhausted across all models
+    if is_quota_or_rate_limit_error(exc):
+        return (
+            True,
+            429,
+            "gemini_rate_limited",
+            "Gemini API quota or rate limit reached across all available models. Please wait for quota refresh and resume.",
+        )
+
+    # 7. 503 / 502 / Service unavailable / Server errors
     if any(k in msg for k in ("503", "unavailable", "service unavailable", "serviceunavailable", "502", "bad gateway")):
         return (
             True,
@@ -488,17 +508,83 @@ Verdict Guidelines:
 """
 
 
+_PLACEHOLDER_DATE_TERMS = {
+    "date unavailable", "unavailable", "not specified", "not announced",
+    "none", "null", "n/a", "unknown", "tbd", "to be announced", "tba",
+    "soon", "closing soon", "ends soon", "coming soon", "no deadline",
+}
+
+
 def _parse_deadline(raw_text: str, meta: dict[str, Any] | None = None) -> DeadlineInfo:
     """Extract deadline from raw text, explicitly detecting ambiguous year vs unambiguous date.
     
     If year is not stated in raw text, attempts to resolve calendar year from post metadata (e.g. posted date).
+    Normalizes relative dates ONLY when the source date is reliably known.
+    Never substitutes current date or invents deadlines.
     """
-    match = _DEADLINE_KW_REGEX.search(raw_text)
+    if not raw_text or not isinstance(raw_text, str) or not raw_text.strip():
+        return DeadlineInfo(
+            raw=None,
+            date=None,
+            year_ambiguous=False,
+            ambiguity_reason=None,
+            reminder_eligible=False,
+            vault_reminder_status="not_connected",
+        )
+
+    raw_clean = raw_text.strip()
+    if raw_clean.lower() in _PLACEHOLDER_DATE_TERMS:
+        return DeadlineInfo(
+            raw=None,
+            date=None,
+            year_ambiguous=False,
+            ambiguity_reason=None,
+            reminder_eligible=False,
+            vault_reminder_status="not_connected",
+        )
+
+    match = _DEADLINE_KW_REGEX.search(raw_clean)
     if not match:
-        month_match = re.search(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_REGEX})(?:\s+(\d{{4}}))?\b", raw_text, re.IGNORECASE)
+        month_match = re.search(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_REGEX})(?:\s+(\d{{4}}))?\b", raw_clean, re.IGNORECASE)
         if not month_match:
-            month_match = re.search(rf"\b({_MONTH_REGEX})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:\s*,?\s*(\d{{4}}))?\b", raw_text, re.IGNORECASE)
+            month_match = re.search(rf"\b({_MONTH_REGEX})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:\s*,?\s*(\d{{4}}))?\b", raw_clean, re.IGNORECASE)
         if not month_match:
+            # Check for relative date mention in raw_clean directly
+            rel_m = re.search(r"\b(\d{1,3})\s+days?\s*(?:left|remaining|more)?\b", raw_clean, re.IGNORECASE)
+            if not rel_m:
+                rel_m = re.search(r"\b(?:closes?|ends?|expires?|in)\s+(\d{1,3})\s+days?\b", raw_clean, re.IGNORECASE)
+            rel_w_m = re.search(r"\b(\d{1,2})\s+weeks?\s*(?:left|remaining|more)?\b", raw_clean, re.IGNORECASE)
+            if not rel_w_m:
+                rel_w_m = re.search(r"\b(?:closes?|ends?|expires?|in)\s+(\d{1,2})\s+weeks?\b", raw_clean, re.IGNORECASE)
+
+            if rel_m or rel_w_m:
+                candidate = (rel_m or rel_w_m).group(0).strip()
+                days_delta = int(rel_m.group(1)) if rel_m else int(rel_w_m.group(1)) * 7
+                if meta and isinstance(meta, dict):
+                    posted_val = str(meta.get("posted") or meta.get("date") or meta.get("post_date") or meta.get("created_at") or "").strip()
+                    posted_iso_m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})", posted_val)
+                    if posted_iso_m:
+                        try:
+                            base_dt = datetime(int(posted_iso_m.group(1)), int(posted_iso_m.group(2)), int(posted_iso_m.group(3)))
+                            resolved_dt = base_dt + timedelta(days=days_delta)
+                            return DeadlineInfo(
+                                raw=candidate,
+                                date=resolved_dt.strftime("%Y-%m-%d"),
+                                year_ambiguous=False,
+                                reminder_eligible=True,
+                                vault_reminder_status="ready_to_connect",
+                            )
+                        except ValueError:
+                            pass
+                return DeadlineInfo(
+                    raw=candidate,
+                    date=None,
+                    year_ambiguous=False,
+                    ambiguity_reason=f"Relative deadline '{candidate}' lacks a reliably known source date; explicit user confirmation required.",
+                    reminder_eligible=False,
+                    vault_reminder_status="not_connected",
+                )
+
             return DeadlineInfo(
                 raw=None,
                 date=None,
@@ -514,16 +600,65 @@ def _parse_deadline(raw_text: str, meta: dict[str, Any] | None = None) -> Deadli
 
     candidate = re.sub(r"^(?:apply\s+)?(?:before|by|on|is|ends|ends\s+on)\s+", "", candidate, flags=re.IGNORECASE).strip()
 
+    if candidate.lower() in _PLACEHOLDER_DATE_TERMS or re.match(r"^(?:none|n/?a|null|unknown|tbd|tba|soon|not\s+specified|date\s+unavailable)$", candidate.lower()):
+        return DeadlineInfo(
+            raw=None,
+            date=None,
+            year_ambiguous=False,
+            ambiguity_reason=None,
+            reminder_eligible=False,
+            vault_reminder_status="not_connected",
+        )
+
+    # Relative date parsing in candidate
+    rel_m = re.search(r"\b(\d{1,3})\s+days?\s*(?:left|remaining|more)?\b", candidate, re.IGNORECASE)
+    if not rel_m:
+        rel_m = re.search(r"\b(?:closes?|ends?|expires?|in)\s+(\d{1,3})\s+days?\b", candidate, re.IGNORECASE)
+    rel_w_m = re.search(r"\b(\d{1,2})\s+weeks?\s*(?:left|remaining|more)?\b", candidate, re.IGNORECASE)
+    if not rel_w_m:
+        rel_w_m = re.search(r"\b(?:closes?|ends?|expires?|in)\s+(\d{1,2})\s+weeks?\b", candidate, re.IGNORECASE)
+
+    if rel_m or rel_w_m:
+        days_delta = int(rel_m.group(1)) if rel_m else int(rel_w_m.group(1)) * 7
+        if meta and isinstance(meta, dict):
+            posted_val = str(meta.get("posted") or meta.get("date") or meta.get("post_date") or meta.get("created_at") or "").strip()
+            posted_iso_m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})", posted_val)
+            if posted_iso_m:
+                try:
+                    base_dt = datetime(int(posted_iso_m.group(1)), int(posted_iso_m.group(2)), int(posted_iso_m.group(3)))
+                    resolved_dt = base_dt + timedelta(days=days_delta)
+                    return DeadlineInfo(
+                        raw=candidate,
+                        date=resolved_dt.strftime("%Y-%m-%d"),
+                        year_ambiguous=False,
+                        reminder_eligible=True,
+                        vault_reminder_status="ready_to_connect",
+                    )
+                except ValueError:
+                    pass
+        return DeadlineInfo(
+            raw=candidate,
+            date=None,
+            year_ambiguous=False,
+            ambiguity_reason=f"Relative deadline '{candidate}' lacks a reliably known source date; explicit user confirmation required.",
+            reminder_eligible=False,
+            vault_reminder_status="not_connected",
+        )
+
     # ISO format: YYYY-MM-DD
     iso_match = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", candidate)
     if iso_match:
-        return DeadlineInfo(
-            raw=candidate,
-            date=iso_match.group(0),
-            year_ambiguous=False,
-            reminder_eligible=True,
-            vault_reminder_status="ready_to_connect",
-        )
+        try:
+            d_obj = datetime.strptime(iso_match.group(0), "%Y-%m-%d")
+            return DeadlineInfo(
+                raw=candidate,
+                date=d_obj.strftime("%Y-%m-%d"),
+                year_ambiguous=False,
+                reminder_eligible=True,
+                vault_reminder_status="ready_to_connect",
+            )
+        except ValueError:
+            pass
 
     # Day Month Year
     dmy = re.search(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_REGEX})\s+(\d{{4}})\b", candidate, re.IGNORECASE)
@@ -568,31 +703,62 @@ def _parse_deadline(raw_text: str, meta: dict[str, Any] | None = None) -> Deadli
         dm_no_year = re.search(rf"\b({_MONTH_REGEX})\s+(\d{{1,2}})(?:st|nd|rd|th)?\b", candidate, re.IGNORECASE)
 
     if dm_no_year:
-        # Check if posting date in meta resolves the ambiguous year
+        resolved_year = None
+        year_provenance = None
+
+        # 1. Check if posting date in meta resolves the ambiguous year
         if meta and isinstance(meta, dict):
             posted_val = str(meta.get("posted") or meta.get("date") or meta.get("post_date") or meta.get("created_at") or "").strip()
             post_year_m = re.search(r"\b(20\d\d)\b", posted_val)
             if post_year_m:
                 resolved_year = int(post_year_m.group(1))
-                g1 = dm_no_year.group(1).lower().rstrip(".")
-                g2 = dm_no_year.group(2).lower().rstrip(".")
-                if g1 in _MONTH_MAP:
-                    month = _MONTH_MAP[g1]
-                    day = int(re.sub(r"\D", "", g2) or "1")
-                else:
-                    day = int(re.sub(r"\D", "", g1) or "1")
-                    month = _MONTH_MAP.get(g2, 1)
-                try:
-                    d_obj = datetime(resolved_year, month, day)
-                    return DeadlineInfo(
-                        raw=candidate,
-                        date=d_obj.strftime("%Y-%m-%d"),
-                        year_ambiguous=False,
-                        reminder_eligible=True,
-                        vault_reminder_status="ready_to_connect",
-                    )
-                except ValueError:
-                    pass
+                year_provenance = f"spoken in reel transcript; year resolved from post metadata ({resolved_year})"
+
+            # 2. Check title or opportunity name in meta
+            if not resolved_year:
+                title_val = str(meta.get("title") or meta.get("name") or "").strip()
+                title_year_m = re.search(r"\b(20\d\d)\b", title_val)
+                if title_year_m:
+                    resolved_year = int(title_year_m.group(1))
+                    year_provenance = f"spoken in reel transcript; year resolved from contextual event evidence ({resolved_year})"
+
+            # 3. Check contextual text passed in meta
+            if not resolved_year:
+                ctx_val = str(meta.get("context_text") or meta.get("caption") or meta.get("transcript") or "").strip()
+                ctx_year_m = re.search(r"\b(20\d\d)\b", ctx_val)
+                if ctx_year_m:
+                    resolved_year = int(ctx_year_m.group(1))
+                    year_provenance = f"spoken in reel transcript; year resolved from contextual event evidence ({resolved_year})"
+
+        # 4. Check full raw_clean / raw_text passed into _parse_deadline
+        if not resolved_year and raw_clean:
+            clean_year_m = re.search(r"\b(20\d\d)\b", raw_clean)
+            if clean_year_m:
+                resolved_year = int(clean_year_m.group(1))
+                year_provenance = f"spoken in reel transcript; year resolved from contextual event evidence ({resolved_year})"
+
+        if resolved_year:
+            g1 = dm_no_year.group(1).lower().rstrip(".")
+            g2 = dm_no_year.group(2).lower().rstrip(".")
+            if g1 in _MONTH_MAP:
+                month = _MONTH_MAP[g1]
+                day = int(re.sub(r"\D", "", g2) or "1")
+            else:
+                day = int(re.sub(r"\D", "", g1) or "1")
+                month = _MONTH_MAP.get(g2, 1)
+            try:
+                d_obj = datetime(resolved_year, month, day)
+                return DeadlineInfo(
+                    raw=candidate,
+                    date=d_obj.strftime("%Y-%m-%d"),
+                    year_ambiguous=False,
+                    reminder_eligible=True,
+                    vault_reminder_status="ready_to_connect",
+                    provenance=year_provenance,
+                    year_resolved_from=f"contextual evidence ({resolved_year})",
+                )
+            except ValueError:
+                pass
 
         return DeadlineInfo(
             raw=candidate,
@@ -601,13 +767,14 @@ def _parse_deadline(raw_text: str, meta: dict[str, Any] | None = None) -> Deadli
             ambiguity_reason="Year not specified in source text (e.g. '" + dm_no_year.group(0) + "'); explicit user confirmation required before scheduling Vault reminder.",
             reminder_eligible=False,
             vault_reminder_status="not_connected",
+            provenance="spoken in reel transcript; year ambiguous",
         )
 
     return DeadlineInfo(
         raw=candidate,
         date=None,
-        year_ambiguous=True,
-        ambiguity_reason="Date format or year is ambiguous; explicit user confirmation required.",
+        year_ambiguous=False,
+        ambiguity_reason="Date format is unparseable as an absolute date; explicit user confirmation required.",
         reminder_eligible=False,
         vault_reminder_status="not_connected",
     )
@@ -677,11 +844,14 @@ def is_substantively_relevant(
         if ev_years and target_year not in ev_years:
             return False, f"Evidence references a different edition/year ({list(ev_years)[0]}) instead of target {target_year}."
 
-    # Check 4: Opportunity disambiguation
+    # Check 4: Opportunity disambiguation & generic root domain rejection
     if title_tokens:
         has_title_match = any(t in text_corpus for t in title_tokens)
+        is_root = is_generic_root_url(ev_url)
+        if is_root and not has_title_match:
+            return False, "Generic homepage does not reference the target opportunity."
         has_org_match = bool(organizer_tokens and any(t in text_corpus for t in organizer_tokens))
-        if not has_title_match and not (has_org_match and source_type == "official_organizer"):
+        if not has_title_match and not (has_org_match and source_type == "official_organizer" and not is_root):
             return False, "Search result does not match distinct opportunity identifiers or organizer."
 
     return True, "Relevant external evidence."
@@ -860,17 +1030,35 @@ def run_extracted_stage(
     year_ambiguous = analysis.year_ambiguous
     ambiguity_reason = analysis.ambiguity_reason
 
-    # Resolve deadline using posting date in meta if deadline_date is missing or marked ambiguous
+    # Resolve deadline using contextual evidence and meta if deadline_date is missing or marked ambiguous
+    deadline_provenance = None
+    year_resolved_from = None
+
     if (not deadline_date or year_ambiguous) and (raw_deadline or combined_text):
-        parsed_dl = _parse_deadline(raw_deadline or combined_text, rvpack.meta)
+        meta_context = dict(rvpack.meta or {})
+        if "context_text" not in meta_context:
+            meta_context["context_text"] = combined_text
+        if "title" not in meta_context and analysis.title:
+            meta_context["title"] = analysis.title
+        parsed_dl = _parse_deadline(raw_deadline or combined_text, meta_context)
         if parsed_dl.date and not parsed_dl.year_ambiguous:
             deadline_date = parsed_dl.date
             raw_deadline = raw_deadline or parsed_dl.raw
             year_ambiguous = False
             ambiguity_reason = None
+            deadline_provenance = parsed_dl.provenance
+            year_resolved_from = parsed_dl.year_resolved_from
+        else:
+            deadline_provenance = parsed_dl.provenance
+            year_resolved_from = parsed_dl.year_resolved_from
 
     if not raw_deadline and not deadline_date:
-        parsed_dl = _parse_deadline(combined_text, rvpack.meta)
+        meta_context = dict(rvpack.meta or {})
+        if "context_text" not in meta_context:
+            meta_context["context_text"] = combined_text
+        if "title" not in meta_context and analysis.title:
+            meta_context["title"] = analysis.title
+        parsed_dl = _parse_deadline(combined_text, meta_context)
         deadline_info = parsed_dl
     else:
         is_valid_date = False
@@ -878,6 +1066,9 @@ def run_extracted_stage(
             try:
                 datetime.strptime(deadline_date, "%Y-%m-%d")
                 is_valid_date = True
+                if not deadline_provenance:
+                    deadline_provenance = "explicitly stated in source text"
+                    year_resolved_from = "explicit date text"
             except ValueError:
                 is_valid_date = False
                 year_ambiguous = True
@@ -891,6 +1082,8 @@ def run_extracted_stage(
             ambiguity_reason=ambiguity_reason,
             reminder_eligible=is_valid_date and not year_ambiguous,
             vault_reminder_status="ready_to_connect" if (is_valid_date and not year_ambiguous) else "not_connected",
+            provenance=deadline_provenance,
+            year_resolved_from=year_resolved_from,
         )
 
     # 3. Registration Fee neutral caution safeguard
@@ -1311,8 +1504,53 @@ def run_card_stage(
         e.get("url") for e in evidence_items
         if e.get("source_type") in {"official_organizer", "trusted_institution"}
         and e.get("domain_trust") in {"official_match", "high"}
+        and not is_generic_root_url(e.get("url", ""))
     }
     claims_summary = [ClaimVerdictItem(**cv) for cv in verdict_data.get("claim_verdicts", [])]
+
+    # Evaluate candidate official registration link
+    title_str = extracted_data.get("title") or ""
+    org_str = extracted_data.get("organizer") or ""
+    cat_str = extracted_data.get("category") or ""
+    candidate_links = list(extracted_data.get("links", []))
+    for ev in evidence_items:
+        u = ev.get("url") if isinstance(ev, dict) else getattr(ev, "url", None)
+        if u and u not in candidate_links:
+            candidate_links.append(u)
+
+    official_reg_url = None
+    official_reg_status = "not_found"
+    for cand in candidate_links:
+        is_reg, status, _ = verify_official_registration_link(
+            cand, organizer=org_str, title=title_str, category=cat_str, evidence_items=evidence_items
+        )
+        if is_reg:
+            official_reg_url = cand
+            official_reg_status = "verified"
+            break
+
+    if not official_reg_url:
+        if candidate_links:
+            official_reg_status = "unable_to_verify"
+        else:
+            official_reg_status = "not_found"
+
+    # Separate supporting evidence links
+    supporting_links = []
+    seen_links = set()
+    if official_reg_url:
+        seen_links.add(official_reg_url.lower())
+
+    for ev in evidence_items:
+        u = ev.get("url") if isinstance(ev, dict) else getattr(ev, "url", None)
+        if u and u.lower() not in seen_links and not is_generic_root_url(u) and "google.com" not in u.lower():
+            seen_links.add(u.lower())
+            supporting_links.append(u)
+
+    for lk in extracted_data.get("links", []):
+        if lk and lk.lower() not in seen_links and not is_generic_root_url(lk) and "google.com" not in lk.lower():
+            seen_links.add(lk.lower())
+            supporting_links.append(lk)
 
     # Core claims must be supported AND supported by an official primary source
     core_claims_officially_supported = any(
@@ -1356,7 +1594,10 @@ def run_card_stage(
         verification_method=verdict_data.get("verification_method", "Gemini AI analysis only"),
         scam_warnings=scam_warnings,
         claims_summary=claims_summary,
-        official_links=extracted_data.get("links", []),
+        official_links=[official_reg_url] if official_reg_url else [],
+        official_registration_url=official_reg_url,
+        official_registration_status=official_reg_status,
+        supporting_links=supporting_links,
         deadline=deadline_info,
         can_save_reminder=can_save_reminder,
         vault_reminder_action=reminder_action,
@@ -1552,6 +1793,10 @@ def connect_deadline_to_vault(
 
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", target_date):
         raise ValueError(f"Invalid date format '{target_date}'. Expected YYYY-MM-DD.")
+    try:
+        datetime.strptime(target_date, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError(f"Invalid calendar date '{target_date}'.")
 
     run = verification_repo.get_run(run_id, user_id)
     if not run:
@@ -1575,18 +1820,12 @@ def connect_deadline_to_vault(
                     target_reel_id = None
             except Exception:
                 pass
-        if not target_reel_id:
-            try:
-                user_reels = main_repo.list_user_reels(user_id, limit=1)
-                if user_reels:
-                    target_reel_id = user_reels[0]["id"]
-            except Exception as exc:
-                log.warning("Could not list user reels from DB (%s)", exc)
 
     if not target_reel_id:
         try:
             from app.schemas.domain import FetchedPost, PostRef
             short_id = str(run_id).replace("-", "")[:8]
+            card_title = card_data.get("title") or "Opportunity"
             ref = PostRef(
                 platform="instagram",
                 shortcode=f"rv_{short_id}",
@@ -1596,8 +1835,16 @@ def connect_deadline_to_vault(
                 platform="instagram",
                 shortcode=f"rv_{short_id}",
                 author=card_data.get("organizer"),
-                transcript=card_data.get("title"),
-                caption=label or f"Deadline: {card_data.get('title', 'Opportunity')}",
+                transcript=card_title,
+                caption=label or f"Deadline: {card_title}",
+                raw={
+                    "custom_title": card_title,
+                    "reel_analysis": {
+                        "title": card_title,
+                        "summary": card_title,
+                        "tags": [card_data.get("category") or "opportunity"],
+                    },
+                },
             )
             post = main_repo.insert_source_post(f, ref)
             linked = main_repo.link_user_reel(user_id, post["id"])
@@ -1610,10 +1857,25 @@ def connect_deadline_to_vault(
     saved_record = None
 
     if target_reel_id:
-        try:
-            saved_record = main_repo.save_date(user_id, target_reel_id, reminder_label.strip(), target_date)
-        except Exception as exc:
-            log.warning("Could not persist to user_saved_dates (%s)", exc)
+        existing_dates = main_repo.list_saved_dates(user_id)
+        for d in existing_dates:
+            if (
+                str(d.get("event_date")) == target_date
+                and d.get("user_reel_id") == target_reel_id
+            ):
+                saved_record = d
+                break
+        if not saved_record:
+            try:
+                saved_record = main_repo.save_date(user_id, target_reel_id, reminder_label.strip(), target_date)
+            except Exception as exc:
+                log.error("Could not persist to user_saved_dates (%s)", exc)
+                raise AppError(f"Database persistence failed: {exc}", status=500, code="db_persistence_failed")
+    else:
+        raise AppError("Could not establish target reel identity to persist calendar reminder.", status=500, code="reel_link_failed")
+
+    if not saved_record or not saved_record.get("id"):
+        raise AppError("Database persistence failed: saved date record was not created.", status=500, code="persistence_failed")
 
     card_data["deadline"]["vault_reminder_status"] = "connected"
     card_data["deadline"]["date"] = target_date
@@ -1629,10 +1891,165 @@ def connect_deadline_to_vault(
 
     return {
         "success": True,
-        "saved_date_id": saved_record.get("id") if saved_record else None,
+        "saved_date_id": saved_record.get("id"),
         "reel_id": target_reel_id,
         "label": reminder_label,
         "event_date": target_date,
         "status": "connected",
         "message": f"Deadline reminder successfully connected to Vault for {target_date}.",
     }
+
+
+def save_opportunity_card_to_vault(run_id: str, user_id: str) -> dict:
+    """Persist the complete Stage 5 opportunity card to the Vault shelf.
+    
+    Requirements:
+    - Run must belong to authenticated user.
+    - All first four stages must be complete, and card stage must exist and be completed.
+    - Persists complete Opportunity Card: title, category, organizer, deadline, overall verdict,
+      claim verdicts, evidence/sources, warnings.
+    - Succeeds even if no deadline exists.
+    - Idempotent: repeated requests for the same run return the same saved opportunity without duplicates.
+    - Does NOT create a calendar event in user_saved_dates.
+    """
+    run = verification_repo.get_run(run_id)
+    if not run:
+        raise AppError("Verification run not found.", status=404, code="not_found")
+    if str(run.get("user_id")) != str(user_id):
+        raise PermissionError(f"Verification run {run_id} does not belong to user {user_id}.")
+
+    stages = verification_repo.list_stages(run_id)
+    completed_stages = {s["stage_name"] for s in stages if s.get("status") == "completed"}
+    required_stages = {"extracted", "claims", "evidence", "verdict", "card"}
+    missing = required_stages - completed_stages
+    if missing:
+        raise ValueError(
+            f"Cannot save to Vault: verification run is incomplete. Missing completed stages: {', '.join(sorted(missing))}."
+        )
+
+    card_stage = verification_repo.get_stage(run_id, StageName.CARD.value)
+    if not card_stage or not card_stage.get("payload"):
+        raise ValueError("Cannot save to Vault: Card stage payload is missing.")
+    card_data = card_stage["payload"]
+
+    verdict_stage = verification_repo.get_stage(run_id, StageName.VERDICT.value)
+    verdict_data = (verdict_stage.get("payload") if verdict_stage else {}) or {}
+
+    evidence_stage = verification_repo.get_stage(run_id, StageName.EVIDENCE.value)
+    evidence_data = (evidence_stage.get("payload") if evidence_stage else {}) or {}
+
+    card_title = (card_data.get("title") or "Opportunity").strip()
+    organizer = (card_data.get("organizer") or "Organizer").strip()
+    category = (card_data.get("category") or "opportunity").strip()
+    deadline_dict = card_data.get("deadline") or {}
+    deadline_date = deadline_dict.get("date")
+    deadline_raw = deadline_dict.get("raw")
+
+    overall_verdict = card_data.get("overall_verdict") or verdict_data.get("overall_verdict") or "supported"
+    claim_verdicts = verdict_data.get("claim_verdicts") or []
+    evidence_items = evidence_data.get("evidence") or []
+    scam_warnings = card_data.get("scam_warnings") or []
+
+    # Gather links and sources
+    links = []
+    if card_data.get("links"):
+        for l in card_data["links"]:
+            if isinstance(l, dict) and l.get("url"):
+                links.append({"name": l.get("name") or "Portal", "url": l["url"]})
+            elif isinstance(l, str) and l.startswith("http"):
+                links.append({"name": "Portal", "url": l})
+    for ev in evidence_items:
+        if isinstance(ev, dict) and ev.get("url"):
+            title_lbl = ev.get("title") or ev.get("domain") or "Verified Evidence"
+            if not any(item["url"] == ev["url"] for item in links):
+                links.append({"name": title_lbl, "url": ev["url"]})
+
+    extracted_dates = []
+    if deadline_date or deadline_raw:
+        extracted_dates.append({
+            "label": f"Deadline: {card_title}",
+            "date": deadline_raw or deadline_date,
+            "iso_date": deadline_date,
+            "url": links[0]["url"] if links else None,
+        })
+
+    reel_analysis = {
+        "title": card_title,
+        "summary": verdict_data.get("summary") or f"{card_title} organized by {organizer}.",
+        "tags": [category.lower(), "opportunity", "verified"],
+        "is_opportunity": True,
+        "details": {
+            "dates": [deadline_date] if deadline_date else ([deadline_raw] if deadline_raw else []),
+            "competitions": [card_title] if category.lower() in ("hackathon", "competition") else [],
+        },
+        "extracted_dates": extracted_dates,
+        "explore": {
+            "organizer": organizer,
+            "category": category.capitalize(),
+            "benefits": "Verified opportunity",
+            "location": "Online / Global",
+        },
+        "sources": links,
+        "resources": [{"label": l.get("name") or "Portal", "url": l["url"]} for l in links if l.get("url")],
+        "overall_verdict": overall_verdict,
+        "claim_verdicts": claim_verdicts,
+        "evidence": evidence_items,
+        "scam_warnings": scam_warnings,
+        "card": card_data,
+    }
+
+    target_reel_id = run.get("user_reel_id")
+    if target_reel_id:
+        existing_reel = None
+        try:
+            existing_reel = main_repo.get_user_reel(user_id, target_reel_id)
+        except Exception as exc:
+            log.warning("Could not check existing user reel (%s)", exc)
+        if existing_reel:
+            try:
+                post_id = existing_reel.get("source_post_id")
+                if post_id:
+                    main_repo.update_source_post_analysis(post_id, analysis=reel_analysis)
+            except Exception:
+                pass
+            return {
+                "success": True,
+                "reel_id": existing_reel["id"],
+                "title": card_title,
+                "already_saved": True,
+                "message": f"Opportunity '{card_title}' is already saved in your Vault.",
+            }
+
+    from app.schemas.domain import FetchedPost, PostRef
+
+    short_id = str(run_id).replace("-", "")[:8]
+    ref = PostRef(
+        platform="instagram",
+        shortcode=f"rv_{short_id}",
+        canonical_url=f"https://reelvault.app/run/{run_id}",
+    )
+    f = FetchedPost(
+        platform="instagram",
+        shortcode=f"rv_{short_id}",
+        author=organizer,
+        transcript=run.get("raw_input") or card_title,
+        caption=card_title,
+        raw={
+            "custom_title": card_title,
+            "reel_analysis": reel_analysis,
+            "verification_run_id": str(run_id),
+        },
+    )
+    post = main_repo.insert_source_post(f, ref)
+    linked = main_repo.link_user_reel(user_id, post["id"])
+    target_reel_id = linked["id"]
+    verification_repo.update_run(run_id, user_reel_id=target_reel_id)
+
+    return {
+        "success": True,
+        "reel_id": target_reel_id,
+        "title": card_title,
+        "already_saved": False,
+        "message": f"'{card_title}' saved to Vault successfully.",
+    }
+

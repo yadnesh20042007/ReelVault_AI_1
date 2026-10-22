@@ -439,4 +439,14 @@ export const api = {
       body,
     });
   },
+
+  saveRVPackToVault: async (runId) => {
+    if (isMockSession()) {
+      return mockStore.saveRVPackToVault(runId);
+    }
+    return request(`/v1/verification/runs/${runId}/save-to-vault`, {
+      method: 'POST',
+    });
+  },
 };
+

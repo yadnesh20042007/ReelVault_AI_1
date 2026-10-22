@@ -480,7 +480,7 @@ export const mockStore = {
     const reel = this.getReel(reelId);
     if (!reel) return null;
 
-    const deadline = reel.analysis?.details?.dates?.[0] || '2026-11-20';
+    const deadline = reel.analysis?.details?.dates?.[0] || reel.analysis?.extracted_dates?.[0]?.iso_date || null;
     const summary = body?.summary || reel.analysis?.summary || `Verified authentic opportunity for "${reel.title}".`;
     const summaryPoints = body?.summary_points?.length > 0 ? body.summary_points : (reel.analysis?.summary_points || []);
     const topics = body?.topics?.length > 0 ? body.topics : (reel.analysis?.tags || ['opportunity', 'verification']);
@@ -528,7 +528,7 @@ export const mockStore = {
           { text: 'Candidates meeting basic prerequisites and submitting required credentials.', source_urls: officialUrls.slice(0, 1) }
         ],
         timeline: [
-          { text: `Deadline scheduled for ${deadline}. Early review recommended.`, source_urls: officialUrls.slice(0, 1) }
+          { text: deadline ? `Deadline scheduled for ${deadline}. Early review recommended.` : 'Deadline not specified in primary records.', source_urls: officialUrls.slice(0, 1) }
         ],
         how_to_apply: [
           { text: 'Register via the official link with resume/portfolio.', source_urls: officialUrls.slice(0, 1) }
@@ -593,17 +593,30 @@ export const mockStore = {
 
   saveDate(reelId, body) {
     const dates = this.getSavedDates();
+    const cleanDate = body.event_date;
+    const cleanLabel = (body.label || 'Important date').trim();
+    const cleanTitle = (body.title || '').trim();
+    const reel = reelId ? this.getReel(reelId) : null;
+    const eventTitle = cleanTitle || reel?.title || cleanLabel;
+
+    // Prevent duplicate events: same reel_id & event_date, or same title & event_date
     const existing = dates.find(
-      (d) => Number(d.reel_id) === Number(reelId) && d.event_date === body.event_date && d.label === body.label
+      (d) =>
+        (Number(d.reel_id) === Number(reelId) && d.event_date === cleanDate) ||
+        (d.title === eventTitle && d.event_date === cleanDate) ||
+        (d.label === cleanLabel && d.event_date === cleanDate && Number(d.reel_id) === Number(reelId))
     );
     if (existing) return existing;
+
     const newId = dates.length > 0 ? Math.max(...dates.map((d) => d.id)) + 1 : 1;
     const newDate = {
       id: newId,
-      reel_id: Number(reelId),
-      label: body.label || 'Important date',
-      event_date: body.event_date,
-      url: body.url || null,
+      reel_id: Number(reelId || newId),
+      label: cleanLabel,
+      event_date: cleanDate,
+      title: eventTitle,
+      source: body.source || body.url || reel?.url || (reel?.author ? `@${reel.author}` : null),
+      url: body.url || reel?.url || null,
       created_at: new Date().toISOString()
     };
     const updated = [newDate, ...dates];
@@ -725,6 +738,11 @@ export const mockStore = {
       },
     ];
 
+    const discoveredDeadline =
+      (reel?.analysis?.details?.dates || [])[0] ||
+      (reel?.analysis?.extracted_dates || [])[0]?.iso_date ||
+      null;
+
     return {
       verified: true,
       verdict: "True",
@@ -736,17 +754,97 @@ export const mockStore = {
       query: q,
       sources: mockSources,
       summary: `Found ${mockSources.length} verified sources via Tavily search platform.`,
+      official_deadline: discoveredDeadline,
     };
   },
 
   submitRVPack: function(content, reelId = null) {
     const runId = 'mock_run_' + Date.now();
     const hasFee500 = /500/.test(content);
-    const hasDeadline = /deadline|date/i.test(content);
+
+    // Dynamically parse title
+    let title = 'National AI Hackathon 2026';
+    const titleMatch = content.match(/title:\s*([^\n\r]+)/i) ||
+                       content.match(/opportunity:\s*([^\n\r]+)/i) ||
+                       content.match(/---TRANSCRIPT---\s*\n([^\n\r]+)/i);
+    if (titleMatch && titleMatch[1].trim()) {
+      title = titleMatch[1].trim().replace(/^[-#*>\s]+/, '');
+    } else if (/paypal/i.test(content)) {
+      title = 'PayPal Global Developer Hackathon 2026';
+    } else if (/26\s*october|october\s*26/i.test(content)) {
+      title = 'AI Founders Grant 2026';
+    }
+
+    // Dynamically parse organizer
+    let organizer = 'IIT Bombay';
+    const orgMatch = content.match(/author:\s*([^\n\r]+)/i) || content.match(/organizer:\s*([^\n\r]+)/i);
+    if (orgMatch && orgMatch[1].trim()) {
+      organizer = orgMatch[1].trim();
+    } else if (/paypal/i.test(content)) {
+      organizer = 'PayPal Developer Relations';
+    } else if (/26\s*october|october\s*26/i.test(content)) {
+      organizer = 'Global AI Grant Initiative';
+    }
+
+    // Dynamically parse deadline (do not invent dates if absent)
+    let deadlineDate = null;
+    let deadlineRaw = null;
+    const isoMatch = content.match(/\b(20\d{2}-\d{2}-\d{2})\b/);
+    if (isoMatch) {
+      deadlineDate = isoMatch[1];
+      deadlineRaw = isoMatch[1];
+    } else {
+      const textDateMatch = content.match(/(\d{1,2}(?:st|nd|rd|th)?\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)(?:\s+\d{4})?)/i);
+      if (textDateMatch) {
+        deadlineRaw = textDateMatch[1];
+        if (/\b20\d{2}\b/.test(textDateMatch[1])) {
+          const d = new Date(textDateMatch[1]);
+          if (!Number.isNaN(d.getTime())) {
+            deadlineDate = d.toISOString().slice(0, 10);
+          }
+        }
+      }
+    }
+
+    let targetReelId = reelId;
+    if (!targetReelId) {
+      const reels = this.getReels();
+      targetReelId = (reels.length > 0 ? Math.max(...reels.map((r) => r.reel_id)) : 0) + 1;
+      const newReel = {
+        reel_id: targetReelId,
+        platform: 'instagram',
+        url: `https://reelvault.app/run/${runId}`,
+        title: title,
+        author: organizer,
+        transcript_status: 'verified',
+        transcript: content,
+        caption: `Deadline: ${deadlineRaw}. Organized by ${organizer}`,
+        created_at: new Date().toISOString(),
+        cached: false,
+        analysis: {
+          title: title,
+          summary: `Verified opportunity: **${title}** organized by **${organizer}**.`,
+          summary_points: [
+            `Organized by ${organizer}.`,
+            `Application deadline: ${deadlineRaw}.`
+          ],
+          tags: ['hackathon', 'opportunity', 'developer'],
+          extracted_dates: [
+            { label: 'Application Deadline', date: deadlineRaw, iso_date: deadlineDate }
+          ],
+          details: {
+            dates: [deadlineDate],
+            competitions: [title]
+          }
+        }
+      };
+      this.setReels([newReel, ...reels]);
+    }
+
     const run = {
       id: runId,
       user_id: MOCK_ADMIN_USER.id,
-      user_reel_id: reelId,
+      user_reel_id: targetReelId,
       input_type: 'rvpack',
       status: 'completed',
       current_stage: 'completed',
@@ -760,21 +858,21 @@ export const mockStore = {
           stage_order: 1,
           status: 'completed',
           payload: {
-            title: 'National AI Hackathon 2026',
-            organizer: 'IIT Bombay',
+            title: title,
+            organizer: organizer,
             category: 'hackathon',
             has_fee: hasFee500,
             is_fee_warning: hasFee500,
             fee_raw: hasFee500 ? '₹500' : null,
             fee_warning_message: hasFee500 ? 'Registration fee detected (₹500). Verify the organizer\'s identity, official event page, payment recipient, and refund policy before paying. A fee alone does not establish fraud.' : null,
             deadline: {
-              raw: '15th December 2026',
-              date: '2026-12-15',
+              raw: deadlineRaw,
+              date: deadlineDate,
               year_ambiguous: false,
               reminder_eligible: true,
               vault_reminder_status: 'ready_to_connect',
             },
-            links: ['https://iitb.ac.in/hackathon'],
+            links: ['https://opportunity-verified.org'],
           },
           created_at: new Date().toISOString(),
         },
@@ -786,8 +884,8 @@ export const mockStore = {
           status: 'completed',
           payload: {
             claims: [
-              { claim_id: 'c1', claim_text: 'The opportunity is organized by IIT Bombay.', claim_type: 'organizer', is_fee_warning_claim: false },
-              { claim_id: 'c2', claim_text: 'Application deadline is 15th December 2026.', claim_type: 'deadline', is_fee_warning_claim: false },
+              { claim_id: 'c1', claim_text: `The opportunity is organized by ${organizer}.`, claim_type: 'organizer', is_fee_warning_claim: false },
+              { claim_id: 'c2', claim_text: `Application deadline is ${deadlineRaw}.`, claim_type: 'deadline', is_fee_warning_claim: false },
               ...(hasFee500 ? [{ claim_id: 'c3', claim_text: 'Registration fee of ₹500 is required.', claim_type: 'fee', is_fee_warning_claim: true }] : []),
             ],
             total_claims: hasFee500 ? 3 : 2,
@@ -805,15 +903,15 @@ export const mockStore = {
               {
                 id: 'ev1',
                 claim_ids: ['c1'],
-                url: 'https://iitb.ac.in/hackathon',
-                title: 'IIT Bombay Official Portal',
-                snippet: 'Official hackathon details hosted on verified ac.in academic portal.',
-                domain: 'iitb.ac.in',
+                url: 'https://opportunity-verified.org',
+                title: `${organizer} Official Portal`,
+                snippet: `Official opportunity details hosted on verified ${organizer} portal.`,
+                domain: 'opportunity-verified.org',
                 domain_trust: 'high',
               },
             ],
-            queries_used: ['IIT Bombay National AI Hackathon official apply'],
-            official_domains: ['iitb.ac.in'],
+            queries_used: [`${title} official apply`],
+            official_domains: ['opportunity-verified.org'],
           },
           created_at: new Date().toISOString(),
         },
@@ -825,12 +923,12 @@ export const mockStore = {
           status: 'completed',
           payload: {
             claim_verdicts: [
-              { claim_id: 'c1', claim_text: 'The opportunity is organized by IIT Bombay.', verdict: 'supported', explanation: 'Matches official high-trust academic domain.' },
-              { claim_id: 'c2', claim_text: 'Application deadline is 15th December 2026.', verdict: 'supported', explanation: 'Corroborated by portal timeline.' },
+              { claim_id: 'c1', claim_text: `The opportunity is organized by ${organizer}.`, verdict: 'supported', explanation: 'Matches official portal records.' },
+              { claim_id: 'c2', claim_text: `Application deadline is ${deadlineRaw}.`, verdict: 'supported', explanation: 'Corroborated by portal timeline.' },
               ...(hasFee500 ? [{ claim_id: 'c3', claim_text: 'Registration fee of ₹500 is required.', verdict: 'supported', explanation: 'Registration fee confirmed in official announcement. A fee alone does not establish fraud.', is_fee_warning_claim: true }] : []),
             ],
             overall_verdict: 'supported',
-            summary: 'Opportunity claims are supported by official academic portal records.' + (hasFee500 ? ' Registration fee detected (₹500); verify official organizer details before paying.' : ''),
+            summary: `Opportunity claims are supported by official records from ${organizer}.` + (hasFee500 ? ' Registration fee detected (₹500); verify official organizer details before paying.' : ''),
             scam_warnings: hasFee500 ? ['Registration fee detected (₹500). Verify the organizer\'s identity, official event page, payment recipient, and refund policy before paying. A fee alone does not establish fraud.'] : [],
             has_scam_warning: hasFee500,
             fraudulent_detected: false,
@@ -846,15 +944,15 @@ export const mockStore = {
           payload: {
             card_id: `card_${runId}`,
             run_id: runId,
-            title: 'IIT Bombay AI Hackathon 2026',
-            organizer: 'IIT Bombay',
+            title: title,
+            organizer: organizer,
             category: 'hackathon',
             overall_verdict: 'supported',
             badge: 'OFFICIAL VERIFIED',
             scam_warnings: hasFee500 ? ['Registration fee detected (₹500). Verify the organizer\'s identity, official event page, payment recipient, and refund policy before paying. A fee alone does not establish fraud.'] : [],
             deadline: {
-              raw: '15th December 2026',
-              date: '2026-12-15',
+              raw: deadlineRaw,
+              date: deadlineDate,
               year_ambiguous: false,
               reminder_eligible: true,
               vault_reminder_status: 'ready_to_connect',
@@ -869,15 +967,15 @@ export const mockStore = {
       card: {
         card_id: `card_${runId}`,
         run_id: runId,
-        title: 'IIT Bombay AI Hackathon 2026',
-        organizer: 'IIT Bombay',
+        title: title,
+        organizer: organizer,
         category: 'hackathon',
         overall_verdict: 'supported',
         badge: 'OFFICIAL VERIFIED',
         scam_warnings: hasFee500 ? ['Registration fee detected (₹500). Verify the organizer\'s identity, official event page, payment recipient, and refund policy before paying. A fee alone does not establish fraud.'] : [],
         deadline: {
-          raw: '15th December 2026',
-          date: '2026-12-15',
+          raw: deadlineRaw,
+          date: deadlineDate,
           year_ambiguous: false,
           reminder_eligible: true,
           vault_reminder_status: 'ready_to_connect',
@@ -914,17 +1012,113 @@ export const mockStore = {
   },
 
   connectVaultReminder: function(runId, body = {}) {
-    const eventDate = body.event_date || '2026-12-15';
-    const label = body.label || 'Deadline: IIT Bombay AI Hackathon';
-    this.saveDate(body.reel_id || 1, { label, event_date: eventDate });
+    let run = null;
+    try {
+      run = this.getVerificationRun(runId);
+    } catch {}
+    const card = run?.card || {};
+    const eventDate = body.event_date || card.deadline?.date;
+    if (!eventDate || !/^\d{4}-\d{2}-\d{2}$/.test(eventDate)) {
+      throw new Error("Valid calendar date (YYYY-MM-DD) is required to connect a deadline reminder.");
+    }
+    const targetTitle = card.title || body.title || 'Saved Opportunity';
+    const label = body.label || `Deadline: ${targetTitle}`;
+    const targetReelId = body.reel_id || run?.user_reel_id || 1;
+
+    const saved = this.saveDate(targetReelId, {
+      label,
+      event_date: eventDate,
+      title: targetTitle,
+      source: card.organizer || 'Official Portal',
+      url: `https://reelvault.app/run/${runId}`
+    });
     return {
       success: true,
-      saved_date_id: Date.now(),
-      reel_id: body.reel_id || 1,
+      saved_date_id: saved.id,
+      reel_id: targetReelId,
+      title: targetTitle,
       label,
       event_date: eventDate,
       status: 'connected',
       message: `Deadline reminder successfully connected to Vault for ${eventDate}.`,
     };
   },
+
+  saveRVPackToVault: function(runId) {
+    let run = null;
+    try {
+      run = this.getVerificationRun(runId);
+    } catch {}
+    if (!run) {
+      throw new Error(`Verification run ${runId} not found.`);
+    }
+
+    const card = run?.card || {};
+    const cardTitle = card.title || 'Saved Opportunity';
+
+    // Check if already saved in reels
+    const existingReel = this.reels.find(
+      (r) => r.verification_run_id === runId || (run.user_reel_id && r.reel_id === run.user_reel_id)
+    );
+    if (existingReel) {
+      return {
+        success: true,
+        reel_id: existingReel.reel_id,
+        title: cardTitle,
+        already_saved: true,
+        message: `Opportunity '${cardTitle}' is already saved in your Vault.`,
+      };
+    }
+
+    const targetReelId = run.user_reel_id || Date.now();
+    const newReel = {
+      reel_id: targetReelId,
+      platform: 'instagram',
+      url: `https://reelvault.app/run/${runId}`,
+      title: cardTitle,
+      author: card.organizer || 'Organizer',
+      transcript: run.raw_input || cardTitle,
+      caption: cardTitle,
+      transcript_status: 'verified',
+      analysis: {
+        title: cardTitle,
+        summary: card.summary || `Verified opportunity: ${cardTitle}`,
+        tags: [card.category || 'opportunity', 'verified'],
+        is_opportunity: true,
+        details: {
+          dates: card.deadline?.date ? [card.deadline.date] : [],
+          competitions: [cardTitle],
+        },
+        extracted_dates: card.deadline?.date ? [{
+          label: `Deadline: ${cardTitle}`,
+          date: card.deadline.date,
+          iso_date: card.deadline.date,
+          url: card.links?.[0]?.url || null,
+        }] : [],
+        explore: {
+          organizer: card.organizer,
+          category: card.category,
+          location: 'Online / Global',
+          benefits: 'Verified opportunity',
+        },
+        sources: (card.links || []).map((l) => ({ name: l.name || 'Portal', url: l.url || l })),
+        resources: (card.links || []).map((l) => ({ label: l.name || 'Portal', url: l.url || l })),
+        overall_verdict: card.overall_verdict || 'supported',
+        card: card,
+      },
+      created_at: new Date().toISOString(),
+      verification_run_id: runId,
+    };
+    this.reels.unshift(newReel);
+    run.user_reel_id = targetReelId;
+
+    return {
+      success: true,
+      reel_id: targetReelId,
+      title: cardTitle,
+      already_saved: false,
+      message: `'${cardTitle}' saved to Vault successfully!`,
+    };
+  },
 };
+

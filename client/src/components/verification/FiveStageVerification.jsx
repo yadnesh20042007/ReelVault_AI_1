@@ -2,7 +2,10 @@ import { useState, useEffect } from 'react';
 import {
   ArrowRight,
   Bell,
+  BookmarkCheck,
+  BookmarkPlus,
   Calendar,
+  CalendarPlus,
   CheckCircle2,
   Clock,
   ExternalLink,
@@ -15,9 +18,13 @@ import {
   ShieldCheck,
   Sparkles,
   XCircle,
+  Link2,
+  AlertCircle,
 } from 'lucide-react';
 import Button from '../ui/Button';
 import { api, ApiError } from '../../services/api';
+import { isValidCalendarDate, isPlaceholderDate } from '../../utils/dateUtils';
+import { isGenericRootUrl } from '../../utils/companyLinks';
 
 const SAMPLE_RVPACK = `---TRANSCRIPT---
 National AI Hackathon 2026 organized by IIT Bombay.
@@ -87,6 +94,17 @@ export default function FiveStageVerification() {
   const [reminderConfirmedDate, setReminderConfirmedDate] = useState('');
   const [reminderMessage, setReminderMessage] = useState('');
   const [showDatePrompt, setShowDatePrompt] = useState(false);
+  const [isSavingVault, setIsSavingVault] = useState(false);
+  const [vaultSaved, setVaultSaved] = useState(false);
+  const [vaultSaveMessage, setVaultSaveMessage] = useState('');
+
+  useEffect(() => {
+    if (activeRun?.user_reel_id) {
+      setVaultSaved(true);
+    } else {
+      setVaultSaved(false);
+    }
+  }, [activeRun?.id, activeRun?.user_reel_id]);
 
   useEffect(() => {
     if (!isLoading) return;
@@ -111,6 +129,7 @@ export default function FiveStageVerification() {
     setError('');
     setIsLoading(true);
     setReminderMessage('');
+    setVaultSaveMessage('');
     setShowDatePrompt(false);
 
     try {
@@ -144,6 +163,26 @@ export default function FiveStageVerification() {
       }
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleSaveToVault = async () => {
+    if (!activeRun?.id) return;
+    setIsSavingVault(true);
+    setVaultSaveMessage('');
+    setError('');
+
+    try {
+      const res = await api.saveRVPackToVault(activeRun.id);
+      setVaultSaved(true);
+      setVaultSaveMessage(res.message || 'Opportunity saved to Vault!');
+      if (res.reel_id) {
+        setActiveRun((prev) => (prev ? { ...prev, user_reel_id: res.reel_id } : prev));
+      }
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Could not save opportunity to Vault.');
+    } finally {
+      setIsSavingVault(false);
     }
   };
 
@@ -535,40 +574,195 @@ export default function FiveStageVerification() {
                   <div className="text-right">
                     <div className="text-xs text-[#776A83]">Deadline</div>
                     <div className="text-base font-black text-[#6D28D9]">
-                      {card.deadline?.date || card.deadline?.raw || 'Not specified'}
+                      {card.deadline?.date || (card.deadline?.raw && !isPlaceholderDate(card.deadline.raw) ? card.deadline.raw : 'Date unavailable')}
                     </div>
                   </div>
                 </div>
 
-              {/* Card Action: Connect Vault Reminder */}
-              <div className="p-4 rounded-2xl bg-[#F0E8FF]/60 border border-[#E3D4F8] flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-                <div>
-                  <div className="text-xs font-bold uppercase text-[#6D28D9] flex items-center gap-1.5">
-                    <Bell size={14} /> Vault Deadline Reminder
-                  </div>
-                  <p className="text-xs text-[#776A83] mt-0.5">
-                    {card.deadline?.vault_reminder_status === 'connected'
-                      ? '✓ This deadline is actively connected to your Vault calendar reminders.'
-                      : 'Save this deadline to your Vault calendar shelf to prevent missed applications.'}
-                  </p>
+              {/* Official Registration Link & Supporting Evidence Section */}
+              <div className="p-4 rounded-2xl bg-white border border-[#E3D4F8] space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-[#E3D4F8]/60 pb-2.5">
+                  <span className="text-xs font-bold uppercase tracking-wider text-[#6D28D9] flex items-center gap-1.5">
+                    <Link2 size={14} /> Official Registration & Opportunity Links
+                  </span>
+                  {card.official_registration_url ? (
+                    <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300">
+                      <CheckCircle2 size={11} /> Verified Registration Link
+                    </span>
+                  ) : card.official_registration_status === "unable_to_verify" ? (
+                    <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-300">
+                      <AlertCircle size={11} /> Unable to Verify Official Registration Link
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-gray-100 text-gray-700 border border-gray-300">
+                      <Search size={11} /> Official Registration Link Not Found
+                    </span>
+                  )}
                 </div>
 
-                {card.deadline?.vault_reminder_status === 'connected' ? (
-                  <span className="text-xs font-bold text-emerald-700 bg-emerald-100 px-3 py-1.5 rounded-xl flex items-center gap-1.5">
-                    <CheckCircle2 size={14} /> Reminder Connected
-                  </span>
+                {card.official_registration_url ? (
+                  <div className="flex flex-wrap items-center justify-between gap-3 p-3 rounded-xl bg-emerald-50/70 border border-emerald-200">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-bold text-emerald-950 truncate">
+                        {card.official_registration_url}
+                      </p>
+                      <p className="text-[11px] text-emerald-700 mt-0.5">
+                        Verified official registration page for {card.title}
+                      </p>
+                    </div>
+                    <a
+                      href={card.official_registration_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1.5 text-xs font-bold px-3.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white transition-colors shadow-xs shrink-0"
+                    >
+                      Register on Official Portal <ExternalLink size={12} />
+                    </a>
+                  </div>
                 ) : (
-                  <Button
-                    type="button"
-                    onClick={() => handleConnectReminder()}
-                    disabled={connectingReminder}
-                    className="shrink-0 bg-[#6D28D9] hover:bg-[#5B21B6] text-white text-xs font-bold px-4 py-2.5 rounded-xl flex items-center gap-2 cursor-pointer"
-                  >
-                    {connectingReminder ? <LoaderCircle size={14} className="animate-spin" /> : <Calendar size={14} />}
-                    Connect to Vault Reminder
-                  </Button>
+                  <div className="p-3 rounded-xl bg-gray-50 border border-gray-200">
+                    <p className="text-xs text-gray-700">
+                      {card.official_registration_status === "unable_to_verify"
+                        ? "Unable to verify official registration link: Candidate links could not be verified as an authentic registration destination for this opportunity. Please check the organizer's original post or official event page."
+                        : "Official registration link not found in original post or verified records. Please check the organizer's original post or official event page."}
+                    </p>
+                  </div>
+                )}
+
+                {/* Supporting Links (Distinct from official registration) */}
+                {((card.supporting_links && card.supporting_links.length > 0) || (card.evidence_links && card.evidence_links.length > 0)) && (
+                  <div className="pt-2">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-gray-500 block mb-1.5">
+                      Supporting Evidence & Reference Links
+                    </span>
+                    <div className="flex flex-wrap gap-2">
+                      {Array.from(new Set([...(card.supporting_links || []), ...(card.evidence_links || [])]))
+                        .filter((u) => u !== card.official_registration_url && !isGenericRootUrl(u))
+                        .slice(0, 5)
+                        .map((u, i) => {
+                          let label = u;
+                          try {
+                            label = new URL(u).hostname.replace(/^www\./, "");
+                          } catch {}
+                          return (
+                            <a
+                              key={i}
+                              href={u}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 text-[11px] text-[#6D28D9] bg-[#F0E8FF] border border-[#E3D4F8] px-2.5 py-1 rounded-lg hover:bg-[#E3D4F8] transition-colors"
+                            >
+                              <span>{label}</span>
+                              <ExternalLink size={10} />
+                            </a>
+                          );
+                        })}
+                    </div>
+                  </div>
                 )}
               </div>
+
+              {/* Card Actions: 1) Save to Vault and 2) Add to Calendar */}
+              {(() => {
+                const rawDl = card.deadline?.date;
+                const hasValidDeadline = Boolean(
+                  rawDl && isValidCalendarDate(rawDl)
+                );
+
+                return (
+                  <div className="grid gap-3 sm:grid-cols-2 pt-2 border-t border-[#E3D4F8]">
+                    {/* Action 1: Save to Vault */}
+                    <div className="p-4 rounded-2xl bg-[#F0E8FF]/60 border border-[#E3D4F8] flex flex-col justify-between gap-3">
+                      <div>
+                        <div className="text-xs font-bold uppercase text-[#6D28D9] flex items-center gap-1.5">
+                          <BookmarkPlus size={14} /> Vault Storage
+                        </div>
+                        <p className="text-xs text-[#776A83] mt-1">
+                          {vaultSaved
+                            ? '✓ Opportunity card, verdicts, and evidence links are saved to your Vault shelf.'
+                            : 'Save this verified opportunity to your Vault shelf so you can revisit and track it anytime.'}
+                        </p>
+                      </div>
+
+                      {vaultSaved ? (
+                        <span className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-800 bg-emerald-100 border border-emerald-300 px-3.5 py-2 rounded-xl self-start shadow-2xs">
+                          <BookmarkCheck size={14} className="text-emerald-600" /> Saved to Vault
+                        </span>
+                      ) : (
+                        <Button
+                          type="button"
+                          onClick={handleSaveToVault}
+                          disabled={isSavingVault}
+                          className="self-start bg-[#6D28D9] hover:bg-[#5B21B6] text-white text-xs font-bold px-4 py-2.5 rounded-xl flex items-center gap-2 cursor-pointer shadow-xs disabled:opacity-50"
+                        >
+                          {isSavingVault ? (
+                            <>
+                              <LoaderCircle size={14} className="animate-spin" /> Saving to Vault…
+                            </>
+                          ) : (
+                            <>
+                              <BookmarkPlus size={14} /> Save to Vault
+                            </>
+                          )}
+                        </Button>
+                      )}
+                    </div>
+
+                    {/* Action 2: Add to Calendar */}
+                    <div className="p-4 rounded-2xl bg-[#F0E8FF]/60 border border-[#E3D4F8] flex flex-col justify-between gap-3">
+                      <div>
+                        <div className="text-xs font-bold uppercase text-[#6D28D9] flex items-center gap-1.5">
+                          <CalendarPlus size={14} /> Calendar Reminder
+                        </div>
+                        <p className="text-xs text-[#776A83] mt-1">
+                          {hasValidDeadline
+                            ? card.deadline?.vault_reminder_status === 'connected'
+                              ? '✓ This deadline is actively connected to your Vault calendar reminders.'
+                              : 'Schedule this deadline in your Vault calendar to prevent missing the application window.'
+                            : 'No verified calendar deadline has been established for this opportunity. Calendar reminders cannot be scheduled.'}
+                        </p>
+                      </div>
+
+                      {hasValidDeadline ? (
+                        card.deadline?.vault_reminder_status === 'connected' ? (
+                          <span className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-800 bg-emerald-100 border border-emerald-300 px-3.5 py-2 rounded-xl self-start shadow-2xs">
+                            <CheckCircle2 size={14} className="text-emerald-600" /> Reminder Connected
+                          </span>
+                        ) : (
+                          <Button
+                            type="button"
+                            onClick={() => handleConnectReminder()}
+                            disabled={connectingReminder}
+                            className="self-start bg-[#8B5CF6] hover:bg-[#7C3AED] text-white text-xs font-bold px-4 py-2.5 rounded-xl flex items-center gap-2 cursor-pointer shadow-xs disabled:opacity-50"
+                          >
+                            {connectingReminder ? (
+                              <>
+                                <LoaderCircle size={14} className="animate-spin" /> Connecting…
+                              </>
+                            ) : (
+                              <>
+                                <Calendar size={14} /> Add to Calendar
+                              </>
+                            )}
+                          </Button>
+                        )
+                      ) : (
+                        <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-gray-500 bg-gray-100 border border-gray-200 px-3.5 py-2 rounded-xl self-start cursor-not-allowed">
+                          <Clock size={13} /> No Usable Deadline Available
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })()}
+
+
+              {vaultSaveMessage && (
+                <div className="flex items-center gap-2 text-emerald-700 text-xs font-bold bg-emerald-50 p-3 rounded-xl border border-emerald-200">
+                  <CheckCircle2 size={16} />
+                  <span>{vaultSaveMessage}</span>
+                </div>
+              )}
 
               {/* Ambiguous Date Confirmation Prompt */}
               {showDatePrompt && (

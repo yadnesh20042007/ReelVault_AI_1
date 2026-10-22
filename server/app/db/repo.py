@@ -239,6 +239,19 @@ def delete_saved_link(user_id: str, link_id: int) -> bool:
 
 
 def save_date(user_id: str, reel_id: int, label: str, event_date: str) -> dict:
+    existing = _one(
+        get_db()
+        .table("user_saved_dates")
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("user_reel_id", reel_id)
+        .eq("event_date", event_date)
+        .limit(1)
+        .execute()
+    )
+    if existing:
+        return existing
+
     result = get_db().table("user_saved_dates").upsert(
         {"user_id": user_id, "user_reel_id": reel_id, "label": label, "event_date": event_date},
         on_conflict="user_id,user_reel_id,event_date,label",

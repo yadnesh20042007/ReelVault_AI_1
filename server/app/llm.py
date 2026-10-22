@@ -27,23 +27,138 @@ def _mask_key(key: str) -> str:
     return f"{key[:4]}...{key[-4:]}"
 
 
-def _is_key_or_quota_error(exc: Exception) -> bool:
-    if isinstance(exc, (ResourceExhausted, TooManyRequests)):
+class ModelQuotaError(ResourceExhausted):
+    """Raised when a specific model encounters quota exhaustion or rate limits."""
+
+    def __init__(self, model_name: str, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.model_name = model_name
+        self.retry_after = retry_after
+
+
+class AllModelsExhaustedError(ResourceExhausted):
+    """Raised when all configured primary and fallback models are quota-exhausted."""
+
+    def __init__(self, message: str, exhausted_models: list[str]):
+        super().__init__(message)
+        self.exhausted_models = exhausted_models
+
+
+def is_quota_or_rate_limit_error(exc: Exception) -> bool:
+    """Strictly detect genuine 429 quota exhaustion or rate limits from Gemini / LangChain."""
+    if isinstance(exc, (ResourceExhausted, TooManyRequests, ModelQuotaError, AllModelsExhaustedError)):
         return True
     msg = str(exc).lower()
+
+    # Exclude non-quota errors immediately
+    if any(
+        k in msg
+        for k in (
+            "unauthenticated",
+            "invalid api key",
+            "api_key_invalid",
+            "permission_denied",
+            "permissiondenied",
+            "invalid argument",
+            "invalidargument",
+            "is not found for api version",
+            "model not found",
+        )
+    ):
+        return False
+
     return any(
         needle in msg
         for needle in (
             "429",
             "resource_exhausted",
+            "resourceexhausted",
             "quota",
             "rate limit",
+            "rate_limit",
             "too many requests",
+            "exceeded your current quota",
+            "check quota",
+        )
+    )
+
+
+def is_auth_error(exc: Exception) -> bool:
+    """Detect invalid API keys or unauthenticated access (401/403)."""
+    msg = str(exc).lower()
+    return any(
+        needle in msg
+        for needle in (
             "api_key_invalid",
             "unauthenticated",
             "invalid api key",
+            "permission_denied",
+            "permissiondenied",
+            "401",
+            "403",
         )
     )
+
+
+def is_not_found_error(exc: Exception) -> bool:
+    """Detect unsupported or non-existent model identifiers (404)."""
+    msg = str(exc).lower()
+    return any(
+        needle in msg
+        for needle in (
+            "404",
+            "not_found",
+            "not found",
+            "is not found for api version",
+            "model not found",
+        )
+    )
+
+
+def is_invalid_argument_error(exc: Exception) -> bool:
+    """Detect bad requests or malformed parameters (400)."""
+    msg = str(exc).lower()
+    return any(
+        needle in msg
+        for needle in (
+            "400",
+            "invalid_argument",
+            "invalid argument",
+            "bad request",
+        )
+    )
+
+
+def parse_retry_after(exc: Exception) -> float | None:
+    """Extract retry-after cooldown duration from exception headers or message."""
+    resp = getattr(exc, "response", None)
+    if resp and hasattr(resp, "headers"):
+        retry_hdr = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+        if retry_hdr:
+            try:
+                val = float(retry_hdr)
+                if val > 0:
+                    return min(max(val, 5.0), 86400.0)
+            except (ValueError, TypeError):
+                pass
+
+    msg = str(exc)
+    m = re.search(r"retry\s+(?:in|after)[:\s]+(\d+(?:\.\d+)?)\s*s?", msg, re.IGNORECASE)
+    if m:
+        try:
+            val = float(m.group(1))
+            if val > 0:
+                return min(max(val, 5.0), 86400.0)
+        except (ValueError, TypeError):
+            pass
+
+    msg_lower = msg.lower()
+    if any(k in msg_lower for k in ("per day", "daily", "day quota", "rpd")):
+        return 1800.0  # 30-minute cooldown for daily limit exhaustion
+    if any(k in msg_lower for k in ("per minute", "rpm", "minute quota")):
+        return 60.0  # 1-minute cooldown for RPM rate limit
+
+    return None
 
 
 class KeyPool:
@@ -80,15 +195,66 @@ class KeyPool:
             exhausted.sort(key=lambda k: self._exhausted_until.get(k, 0))
 
             if healthy:
-                # Distribute requests across healthy keys to spread the rate limit load
                 idx = self._rr_index % len(healthy)
                 self._rr_index += 1
                 rotated = healthy[idx:] + healthy[:idx]
                 return rotated + exhausted
             return exhausted
 
+    def reset(self) -> None:
+        with self._lock:
+            self._exhausted_until.clear()
+            self._rr_index = 0
+
+
+class ModelPool:
+    """Tracks health, exhaustion cooldowns, and fallback priority across Gemini models."""
+
+    def __init__(self, default_cooldown_seconds: float = 60.0):
+        self.default_cooldown_seconds = default_cooldown_seconds
+        self._exhausted_until: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def mark_exhausted(self, model_name: str, duration: float | None = None) -> None:
+        if not model_name:
+            return
+        dur = duration if duration is not None else self.default_cooldown_seconds
+        with self._lock:
+            self._exhausted_until[model_name] = time.time() + dur
+            log.warning(
+                "Gemini model '%s' marked exhausted/rate-limited for %ds; failing over to fallback models.",
+                model_name,
+                int(dur),
+            )
+
+    def is_exhausted(self, model_name: str) -> bool:
+        with self._lock:
+            return time.time() < self._exhausted_until.get(model_name, 0)
+
+    def get_ordered_models(self, all_models: list[str]) -> list[str]:
+        if not all_models:
+            return []
+        if len(all_models) == 1:
+            return all_models
+
+        now = time.time()
+        with self._lock:
+            healthy = [m for m in all_models if now >= self._exhausted_until.get(m, 0)]
+            exhausted = [m for m in all_models if now < self._exhausted_until.get(m, 0)]
+            exhausted.sort(key=lambda m: self._exhausted_until.get(m, 0))
+
+            if healthy:
+                return healthy + exhausted
+            return exhausted
+
+    def reset(self) -> None:
+        with self._lock:
+            self._exhausted_until.clear()
+
 
 _key_pool = KeyPool()
+_model_pool = ModelPool()
+_is_key_or_quota_error = is_quota_or_rate_limit_error
 
 
 class RobustModelOutputParser(BaseOutputParser):
@@ -156,24 +322,34 @@ class RobustModelOutputParser(BaseOutputParser):
 
 
 class MonitoredChatGoogleGenerativeAI(ChatGoogleGenerativeAI):
-    """ChatGoogleGenerativeAI that intercepts quota / rate limit errors to mark the key in KeyPool."""
+    """ChatGoogleGenerativeAI that intercepts quota / rate limit errors to mark the model and key."""
 
     api_key_str: str = ""
+    model_name_str: str = ""
+
+    def _handle_exception(self, exc: Exception) -> None:
+        if is_quota_or_rate_limit_error(exc):
+            cooldown = parse_retry_after(exc)
+            _model_pool.mark_exhausted(self.model_name_str, duration=cooldown)
+            _key_pool.mark_exhausted(self.api_key_str, duration=cooldown)
+            raise ModelQuotaError(
+                model_name=self.model_name_str,
+                message=f"Gemini model '{self.model_name_str}' quota or rate limit exceeded: {exc}",
+                retry_after=cooldown,
+            ) from exc
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
         try:
             return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
         except Exception as exc:
-            if _is_key_or_quota_error(exc):
-                _key_pool.mark_exhausted(self.api_key_str)
+            self._handle_exception(exc)
             raise
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
         try:
             return await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
         except Exception as exc:
-            if _is_key_or_quota_error(exc):
-                _key_pool.mark_exhausted(self.api_key_str)
+            self._handle_exception(exc)
             raise
 
     def with_structured_output(
@@ -217,6 +393,7 @@ def _build_model(model_name: str, key: str, max_retries: int, timeout: float = 3
             model=clean_model,
             api_key=key,
             api_key_str=key,
+            model_name_str=clean_model,
             temperature=0,
             max_retries=max_retries,
             timeout=timeout,
@@ -241,12 +418,36 @@ def get_llm(kind: Literal["fast", "main"] = "main", timeout: float | None = None
     fallback_keys = ordered_keys[1:]
 
     os.environ.setdefault("GOOGLE_API_KEY", primary_key)
-    model = s.llm_model_fast if kind == "fast" else s.llm_model_main
+    primary_model = s.llm_model_fast if kind == "fast" else s.llm_model_main
+    fallback_models = s.get_llm_fallback_models()
+    all_candidate_models = [primary_model] + [m for m in fallback_models if m != primary_model]
+
+    # Order models: healthy models first, exhausted models in cooldown at the end
+    ordered_models = _model_pool.get_ordered_models(all_candidate_models)
+    selected_primary_model = ordered_models[0]
     http_timeout = timeout if timeout is not None else getattr(s, "gemini_http_timeout_s", 30.0)
 
-    primary = _build_model(model, primary_key, s.llm_max_retries, timeout=http_timeout)
-    if not fallback_keys:
+    primary = _build_model(
+        selected_primary_model, primary_key, s.llm_max_retries, timeout=http_timeout
+    )
+
+    fallbacks = []
+    # 1. Other models with primary key (highest priority fallback)
+    for m in ordered_models[1:]:
+        fallbacks.append(
+            _build_model(m, primary_key, s.llm_max_retries, timeout=http_timeout)
+        )
+    # 2. All models with remaining keys if multiple keys configured
+    for k in fallback_keys:
+        for m in ordered_models:
+            fallbacks.append(
+                _build_model(m, k, s.llm_max_retries, timeout=http_timeout)
+            )
+
+    if not fallbacks:
         return primary
 
-    fallbacks = [_build_model(model, k, s.llm_max_retries, timeout=http_timeout) for k in fallback_keys]
-    return primary.with_fallbacks(fallbacks)
+    return primary.with_fallbacks(
+        fallbacks,
+        exceptions_to_handle=(ModelQuotaError, ResourceExhausted, TooManyRequests),
+    )

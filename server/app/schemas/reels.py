@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ReelIn(BaseModel):
@@ -35,6 +35,8 @@ class ExtractedDate(BaseModel):
     date: str
     iso_date: str | None = None
     url: str | None = None
+    provenance: str | None = None
+    year_resolved_from: str | None = None
 
 
 class ExtractedExplore(BaseModel):
@@ -115,6 +117,17 @@ class SavedLinkIn(BaseModel):
 class SavedDateIn(BaseModel):
     label: str = Field(min_length=1, max_length=200)
     event_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    title: str | None = Field(default=None, max_length=300)
+    url: str | None = Field(default=None, max_length=2048)
+
+    @field_validator("event_date")
+    @classmethod
+    def validate_real_date(cls, v: str) -> str:
+        try:
+            datetime.strptime(v, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError(f"'{v}' is not a valid calendar date")
+        return v
 
 
 class SavedLinkOut(SavedLinkIn):
@@ -126,6 +139,8 @@ class SavedLinkOut(SavedLinkIn):
 class SavedDateOut(SavedDateIn):
     id: int
     reel_id: int
+    title: str | None = None
+    url: str | None = None
     created_at: datetime
 
 
@@ -167,3 +182,4 @@ class TavilyVerifyOut(BaseModel):
     query: str = Field(default="")
     sources: list[TavilySourceOut] = Field(default_factory=list)
     summary: str | None = None
+    official_deadline: str | None = None
