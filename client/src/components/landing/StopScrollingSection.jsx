@@ -128,18 +128,20 @@ export default function StopScrollingSection() {
         once: true,
         onEnter: () => {
           setHasScrolledIn(true);
-          // Thanos slowly enters from the left with imposing presence
-          gsap.fromTo(
-            thanosWrapperRef.current,
-            { x: -70, opacity: 0, scale: 0.96 },
-            {
-              x: 0,
-              opacity: 1,
-              scale: 1,
-              duration: 1.25,
-              ease: 'power2.out',
-            }
-          );
+          // Smooth entrance for section content
+          if (thanosWrapperRef.current) {
+            gsap.fromTo(
+              thanosWrapperRef.current,
+              { x: -70, opacity: 0, scale: 0.96 },
+              {
+                x: 0,
+                opacity: 1,
+                scale: 1,
+                duration: 1.25,
+                ease: 'power2.out',
+              }
+            );
+          }
           // Right column content fades in smoothly
           gsap.fromTo(
             rightColRef.current,
@@ -250,7 +252,7 @@ export default function StopScrollingSection() {
       ref={sectionRef} 
       id="make-it-count" 
       className="rv-thanos-section relative w-full px-4 sm:px-6 lg:px-12 py-16 lg:py-24 overflow-hidden select-none"
-      aria-label="Thanos Infinite Snap Experience"
+      aria-label="Infinite Snap Experience"
     >
       {/* Background Cosmic Particle Field */}
       <div className="absolute inset-0 pointer-events-none overflow-hidden -z-10" aria-hidden="true">
@@ -300,143 +302,13 @@ export default function StopScrollingSection() {
         </div>
       </div>
 
-      {/* Main Two-Column Layout (Desktop: Left ~45% Thanos, Right ~55% Experience) */}
-      <div className="max-w-[1360px] mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8 lg:gap-12 items-center">
+      {/* Main Container */}
+      <div className="max-w-[1360px] mx-auto flex justify-center items-center">
         
         {/* =========================================================================
-            LEFT COLUMN: THANOS 3D CHARACTER WITH INTERACTIVE INFINITY GAUNTLET (~45%)
+            HEADLINE, INTERACTIVE SNAP BUTTON & REEL ANALYSIS DEMO
             ========================================================================= */}
-        <div 
-          ref={thanosWrapperRef} 
-          className="lg:col-span-5 flex flex-col items-center justify-center relative w-full"
-        >
-          {/* Imposing Underlight Spotlight Beneath Thanos */}
-          <div 
-            className="absolute bottom-4 left-1/2 -translate-x-1/2 w-4/5 h-32 rounded-full blur-3xl pointer-events-none -z-10"
-            style={{
-              background: 'radial-gradient(ellipse, rgba(168, 85, 247, 0.45) 0%, rgba(234, 179, 8, 0.2) 40%, transparent 75%)'
-            }}
-          />
-
-          {/* Thanos Character Frame with Overlaid Infinity Stones */}
-          <div className="relative inline-block w-full max-w-[420px] sm:max-w-[480px] lg:max-w-[530px]">
-            
-            {/* The 3D Character Asset provided by user */}
-            <img
-              ref={thanosImgRef}
-              src="/assets/thanos/thanos_idle.png"
-              alt="Thanos holding the Infinity Gauntlet"
-              className="w-full h-auto object-contain drop-shadow-[0_20px_45px_rgba(0,0,0,0.85)] filter contrast-[1.04]"
-              loading="lazy"
-            />
-
-            {/* Overlaid Infinity Stones with Dynamic Beacon Glows */}
-            {INFINITY_STONES.map((stone, idx) => {
-              const isSurging = snapState === 'preparing' && activeStoneIndex >= idx;
-              const isSnapping = snapState === 'snapping' || snapState === 'analyzing';
-
-              return (
-                <div
-                  key={stone.id}
-                  className={`rv-infinity-stone ${
-                    isSurging || isSnapping ? 'rv-stone-surge' : 'rv-stone-idle'
-                  }`}
-                  style={{
-                    left: `${stone.x}%`,
-                    top: `${stone.y}%`,
-                    width: `${stone.size}px`,
-                    height: `${stone.isOval ? stone.size * 1.3 : stone.size}px`,
-                    color: stone.color,
-                    background: `radial-gradient(circle, #ffffff 15%, ${stone.color} 70%, transparent 100%)`,
-                    boxShadow: isSurging || isSnapping
-                      ? `0 0 25px ${stone.glow}, 0 0 50px ${stone.color}`
-                      : `0 0 10px ${stone.glow}`,
-                  }}
-                  title={stone.name}
-                  aria-hidden="true"
-                />
-              );
-            })}
-
-            {/* Cosmic Energy Crackle Sparks on Gauntlet during Stage A / B */}
-            {(snapState === 'preparing' || snapState === 'snapping') && (
-              <svg 
-                className="absolute inset-0 w-full h-full pointer-events-none"
-                viewBox="0 0 100 100"
-                aria-hidden="true"
-              >
-                <circle 
-                  cx={SNAP_CONTACT_POINT.x} 
-                  cy={SNAP_CONTACT_POINT.y} 
-                  r="6" 
-                  fill="none" 
-                  stroke="#E879F9" 
-                  strokeWidth="0.8" 
-                  strokeDasharray="2, 2" 
-                  className="animate-spin"
-                  style={{ animationDuration: '0.8s' }}
-                />
-                <circle 
-                  cx={SNAP_CONTACT_POINT.x} 
-                  cy={SNAP_CONTACT_POINT.y} 
-                  r="11" 
-                  fill="none" 
-                  stroke="#C084FC" 
-                  strokeWidth="0.5" 
-                  strokeDasharray="3, 3" 
-                  className="animate-spin"
-                  style={{ animationDuration: '1.6s', animationDirection: 'reverse' }}
-                />
-              </svg>
-            )}
-
-            {/* Stage B: Concentrated Purple-White Snap Flash Burst at Contact Point */}
-            {snapState === 'snapping' && (
-              <div
-                ref={flashRef}
-                className="rv-snap-flash-burst"
-                style={{
-                  left: `${SNAP_CONTACT_POINT.x}%`,
-                  top: `${SNAP_CONTACT_POINT.y}%`,
-                }}
-                aria-hidden="true"
-              />
-            )}
-
-            {/* Stage B: Expanding Circular Cosmic Shockwave Ring */}
-            {snapState === 'snapping' && (
-              <div
-                ref={shockwaveRef}
-                className="rv-shockwave-wave"
-                style={{
-                  left: `${SNAP_CONTACT_POINT.x}%`,
-                  top: `${SNAP_CONTACT_POINT.y}%`,
-                }}
-                aria-hidden="true"
-              />
-            )}
-
-          </div>
-
-          {/* Imposing Character Baseline Label */}
-          <div className="mt-3 text-center">
-            <span className="text-[11px] font-mono tracking-[0.25em] text-[#C084FC]/70 uppercase">
-              {snapState === 'idle'
-                ? 'IN BALANCE · THE GAUNTLET AWAITS'
-                : snapState === 'preparing'
-                ? 'GATHERING COSMIC SIGNAL...'
-                : snapState === 'snapping'
-                ? '⚡ SNAP TRIGGERED'
-                : 'REALITY RECONFIGURED'}
-            </span>
-          </div>
-
-        </div>
-
-        {/* =========================================================================
-            RIGHT COLUMN: HEADLINE, INTERACTIVE SNAP BUTTON & REEL ANALYSIS DEMO (~55%)
-            ========================================================================= */}
-        <div ref={rightColRef} className="lg:col-span-7 flex flex-col justify-center text-left">
+        <div ref={rightColRef} className="w-full max-w-3xl flex flex-col justify-center text-left">
           
           {/* Main Stage Switcher */}
           {snapState === 'idle' || snapState === 'preparing' || snapState === 'snapping' ? (
@@ -503,7 +375,7 @@ export default function StopScrollingSection() {
 
               {/* Helper Micro-copy */}
               <p className="text-xs font-mono text-[#C084FC]/70">
-                Click to activate Thanos's gauntlet and transform the reel into verified data.
+                Click to activate the snap and transform the reel into verified data.
               </p>
 
             </div>
