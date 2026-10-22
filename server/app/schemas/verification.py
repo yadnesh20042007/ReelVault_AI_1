@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 
 class ClaimVerdictLabel(str, Enum):
@@ -119,6 +119,16 @@ class ClaimVerdictItem(BaseModel):
     cited_sources: list[str] = Field(default_factory=list)
     is_fee_warning_claim: bool = False
 
+    @field_validator("verdict", mode="before")
+    @classmethod
+    def normalize_verdict(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            normalized = v.strip().lower().replace("_", " ").replace("-", " ")
+            for label in ClaimVerdictLabel:
+                if label.value == normalized:
+                    return label
+        return v
+
 
 # --- STAGE 1: EXTRACTED ---
 class ExtractedStagePayload(BaseModel):
@@ -166,12 +176,31 @@ class GeminiClaimAnalysis(BaseModel):
 
 
 class GeminiVerdictEvaluation(BaseModel):
-    claim_verdicts: list[ClaimVerdictItem] = Field(description="Evaluations for each claim.")
-    overall_verdict: ClaimVerdictLabel = Field(description="Overall verdict grounded in claim findings.")
-    summary: str = Field(description="Grounded summary of the verification outcome.")
+    claim_verdicts: list[ClaimVerdictItem] = Field(
+        description="Evaluations for each claim.",
+        validation_alias=AliasChoices("claim_verdicts", "claims", "claim_evaluations"),
+    )
+    overall_verdict: ClaimVerdictLabel = Field(
+        description="Overall verdict grounded in claim findings.",
+        validation_alias=AliasChoices("overall_verdict", "verdict"),
+    )
+    summary: str = Field(
+        description="Grounded summary of the verification outcome.",
+        validation_alias=AliasChoices("summary", "explanation", "verdict_summary"),
+    )
     scam_warnings: list[str] = Field(default_factory=list, description="Scam warnings or neutral fee cautions.")
     has_scam_warning: bool = Field(default=False, description="True if fee caution or scam warning is present.")
     fraudulent_detected: bool = Field(default=False, description="True only if concrete fraud/hoax is verified by credible evidence.")
+
+    @field_validator("overall_verdict", mode="before")
+    @classmethod
+    def normalize_overall_verdict(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            normalized = v.strip().lower().replace("_", " ").replace("-", " ")
+            for label in ClaimVerdictLabel:
+                if label.value == normalized:
+                    return label
+        return v
 
 
 class ClaimsStagePayload(BaseModel):
